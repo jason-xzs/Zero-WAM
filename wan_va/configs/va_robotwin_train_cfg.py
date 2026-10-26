@@ -2,6 +2,7 @@
 from easydict import EasyDict
 from .zerowam_train_config import zerowam_train_cfg
 from .va_robotwin_cfg import va_robotwin_cfg
+from .robotwin_tasks import ROBOTWIN_EVAL_TASKS
 import os
 from pathlib import Path
 
@@ -10,7 +11,9 @@ va_robotwin_train_cfg.update(va_robotwin_cfg)
 va_robotwin_train_cfg.update(zerowam_train_cfg)
 
 _repo_root = Path(__file__).resolve().parents[2]
-_human_gen_root = _repo_root / 'data' / 'HumanGen'
+_human_gen_root = Path(os.environ.get(
+    'HUMAN_GEN_ROOT', str(_repo_root / 'data' / 'HumanGen')
+))
 va_robotwin_train_cfg.model_path = os.environ.get(
     'MODEL_PATH', '/path/to/zero-wam-pretrain'
 )
@@ -27,15 +30,7 @@ va_robotwin_train_cfg.human_latent_path = str(
 )
 # Keep the seven zero-shot evaluation tasks out of every Robotwin training run.
 # Released task directories may append a dataset variant after a hyphen.
-va_robotwin_train_cfg.excluded_task_names = [
-    'place_object_scale',
-    'stamp_seal',
-    'open_microwave',
-    'move_stapler_pad',
-    'place_bread_basket',
-    'place_empty_cup',
-    'stack_blocks_three',
-]
+va_robotwin_train_cfg.excluded_task_names = list(ROBOTWIN_EVAL_TASKS)
 va_robotwin_train_cfg.expected_num_train_tasks = 43
 va_robotwin_train_cfg.empty_emb_path = va_robotwin_cfg.empty_text_emb_path
 va_robotwin_train_cfg.save_root = os.environ.get(
@@ -58,4 +53,4 @@ va_robotwin_train_cfg.max_norm = 1.0
 va_robotwin_train_cfg.skip_step_grad_norm_multiplier = 20.0
 va_robotwin_train_cfg.batch_size = 1 
 va_robotwin_train_cfg.gradient_accumulation_steps = 1
-va_robotwin_train_cfg.num_steps = 50000 
+va_robotwin_train_cfg.num_steps = 50000

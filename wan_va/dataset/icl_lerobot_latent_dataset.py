@@ -8,6 +8,7 @@ per item.
 import json
 import os
 import re
+from collections import Counter
 from bisect import bisect_right
 from functools import partial
 from multiprocessing import Pool
@@ -101,6 +102,9 @@ def _construct_icl_dataset(repo_id, config):
 
 def _is_excluded_task_root(dataset_root, config):
     root_name = Path(dataset_root).name
+    included_tasks = getattr(config, 'included_task_names', None)
+    if included_tasks is not None and root_name.split('-', 1)[0] not in included_tasks:
+        return True
     return any(
         root_name == task_name or root_name.startswith(f"{task_name}-")
         for task_name in getattr(config, "excluded_task_names", [])
@@ -121,6 +125,22 @@ def _partition_icl_repos(config):
 
 
 def _validate_training_repo_count(config, included, excluded):
+    requested = getattr(config, 'included_task_names', None)
+    if requested is not None:
+        requested_set = set(requested)
+        if not requested or len(requested_set) != len(requested):
+            raise ValueError('included_task_names must be nonempty and unique')
+        overlap = requested_set.intersection(getattr(config, 'excluded_task_names', []))
+        if overlap:
+            raise ValueError(f'Training tasks overlap held-out tasks: {sorted(overlap)}')
+        counts = Counter(path.name.split('-', 1)[0] for path in included)
+        missing = sorted(requested_set - counts.keys())
+        duplicates = sorted(name for name, count in counts.items() if count > 1)
+        if missing or duplicates:
+            raise ValueError(
+                f'Expected exactly one dataset per selected task; '
+                f'missing={missing}, duplicate_variants={duplicates}'
+            )
     expected = getattr(config, "expected_num_train_tasks", None)
     if expected is not None and len(included) != int(expected):
         raise ValueError(

@@ -1,8 +1,9 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import gc
+import os
 
 import torch
-from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
 
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
@@ -30,6 +31,8 @@ def shard_model(model,
         cast_forward_inputs=False,
     )
     fsdp_config = {"mp_policy": mp_policy, "reshard_after_forward": True}
+    if os.environ.get("ZERO_WAM_CPU_OFFLOAD", "0") == "1":
+        fsdp_config["offload_policy"] = CPUOffloadPolicy(pin_memory=True)
 
     for block in model.blocks:
         fully_shard(block.attn1, **fsdp_config)

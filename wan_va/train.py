@@ -1,7 +1,9 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
 from copy import deepcopy
+from contextlib import nullcontext
 import os
+import time
 from pathlib import Path
 import wandb
 
@@ -16,8 +18,10 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
     StateDictOptions,
 )
-from safetensors.torch import save_file
-from huggingface_hub import split_torch_state_dict_into_shards
+from .checkpoint_io import (
+    save_checkpoint_verified,
+    save_sharded_safetensors as _save_sharded_safetensors,
+)
 import json
 
 from .configs import TRAIN_DATASET_CONFIGS, VA_CONFIGS
@@ -90,6 +94,11 @@ def _build_dataset_sources(config, args, rank, local_rank, world_size):
     sources = []
     for name, weight in entries:
         dataset_config = deepcopy(TRAIN_DATASET_CONFIGS[name])
+        # The active experiment owns task selection. Do not mutate the global
+        # dataset registry or let its full-task defaults overwrite a subset.
+        if name == getattr(config, 'task_selection_dataset', None):
+            for key in ('included_task_names', 'excluded_task_names', 'expected_num_train_tasks'):
+                dataset_config[key] = deepcopy(getattr(config, key))
         if len(entries) == 1:
             dataset_config.update(path_overrides)
 
@@ -134,30 +143,6 @@ def _prepare_safetensors_state_dict(state_dict):
     return output
 
 
-def _save_sharded_safetensors(state_dict, output_dir, max_shard_size="3GB"):
-    filename_pattern = "diffusion_pytorch_model{suffix}.safetensors"
-    split = split_torch_state_dict_into_shards(
-        state_dict,
-        filename_pattern=filename_pattern,
-        max_shard_size=max_shard_size,
-    )
-    for filename, tensor_names in split.filename_to_tensors.items():
-        shard = {name: state_dict[name] for name in tensor_names}
-        save_file(
-            shard,
-            Path(output_dir) / filename,
-            metadata={"format": "pt"},
-        )
-    if split.is_sharded:
-        index = {
-            "metadata": split.metadata,
-            "weight_map": split.tensor_to_filename,
-        }
-        index_path = Path(output_dir) / "diffusion_pytorch_model.safetensors.index.json"
-        with index_path.open("w", encoding="utf-8") as handle:
-            json.dump(index, handle, indent=2)
-
-
 class Trainer:
     @staticmethod
     def _resolve_transformer_path(path):
@@ -170,18 +155,20 @@ class Trainer:
 
     def __init__(self, config):
         if config.enable_wandb and config.rank == 0:
-            wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
             self.wandb = wandb
             self.wandb.init(
-                entity=os.environ["WANDB_TEAM_NAME"],
-                project=os.getenv("WANDB_PROJECT", "va_robotwin"),
-                # dir=log_dir,
+                entity=os.getenv('WANDB_ENTITY') or os.getenv('WANDB_TEAM_NAME'),
+                project=os.getenv('WANDB_PROJECT', getattr(config, 'wandb_project', 'va_robotwin')),
+                dir=os.getenv("WANDB_DIR"),
                 config=config,
-                mode="online",
-                name='test_lln'
-                # name=os.path.basename(os.path.normpath(job_config.job.dump_folder))
+                mode=os.getenv("WANDB_MODE", "online"),
+                name=os.getenv("WANDB_NAME", "robotwin-posttrain"),
             )
-            logger.info("WandB logging enabled")
+            self.wandb.config.update({
+                'effective_batch_size': config.world_size * config.batch_size * config.gradient_accumulation_steps,
+                'sync_each_microbatch': getattr(config, 'sync_each_microbatch', False),
+            })
+            logger.info("WandB logging enabled: %s", self.wandb.run.url)
         self.step = 0
         self.config = config
         self.device = torch.device(f"cuda:{config.local_rank}")
@@ -664,17 +651,30 @@ class Trainer:
 
     def _train_step(self, batch, batch_idx):
         """Train a single batch, returns losses for logging."""
+        first_batch = self.step == 0 and batch_idx == 0 and self.config.rank == 0
+        if first_batch:
+            logger.info("First batch shapes: %s", {
+                key: tuple(value.shape) for key, value in batch.items()
+                if isinstance(value, torch.Tensor)
+            })
         batch = self.convert_input_format(batch)
         input_dict = self._prepare_input_dict(batch)
         
-        should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0
-        
-        if not should_sync:
-            self.transformer.set_requires_gradient_sync(False)
-        else:
-            self.transformer.set_requires_gradient_sync(True)
+        should_update = (batch_idx + 1) % self.gradient_accumulation_steps == 0
+        # Syncing each microbatch retains sharded gradients during accumulation.
+        # Loss scaling and optimizer/scheduler updates still use the full window.
+        sync_each_microbatch = getattr(self.config, 'sync_each_microbatch', False)
+        self.transformer.set_requires_gradient_sync(should_update or sync_each_microbatch)
 
-        output = self.transformer(input_dict, train_mode=True)
+        activation_context = (
+            torch.autograd.graph.save_on_cpu(pin_memory=True)
+            if os.environ.get("ZERO_WAM_ACTIVATION_OFFLOAD", "0") == "1"
+            else nullcontext()
+        )
+        with activation_context:
+            output = self.transformer(input_dict, train_mode=True)
+        if first_batch:
+            logger.info("First forward completed; computing losses and backward")
         latent_loss, action_loss, mcp_losses = self.compute_loss(
             input_dict, output)
         mcp_loss = sum(
@@ -685,6 +685,8 @@ class Trainer:
         loss = latent_loss + action_loss + mcp_loss
 
         loss.backward()
+        if first_batch:
+            logger.info("First backward completed; optimizer update due=%s", should_update)
 
         losses = {
             'latent_loss': latent_loss.detach(),
@@ -694,7 +696,7 @@ class Trainer:
         }
         
         # Only update weights after accumulating gradients
-        if should_sync:
+        if should_update:
             max_norm = float(self.config.max_norm)
             total_norm = torch.nn.utils.clip_grad_norm_(
                 self.transformer.parameters(), max_norm)
@@ -728,61 +730,8 @@ class Trainer:
         return losses
 
     def save_checkpoint(self,):
-        """Save model checkpoint in the same format as pretrained model."""
-        try:
-            state_dict = get_model_state_dict(
-                self.transformer,
-                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-            )
-            state_dict_bf16 = _prepare_safetensors_state_dict(state_dict)
-            # optim_state = get_optimizer_state_dict(
-            #         self.transformer, self.optimizer,
-            #         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-            #     )
-
-            # Only rank 0 saves the checkpoint
-            if self.config.rank == 0:
-                checkpoint_dir = self.save_dir / f"checkpoint_step_{self.step}"
-                checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-                # Save transformer in the same format as pretrained model
-                transformer_dir = checkpoint_dir / "transformer"
-                transformer_dir.mkdir(parents=True, exist_ok=True)
-
-                logger.info(f"Saving transformer to {transformer_dir}")
-
-                _save_sharded_safetensors(state_dict_bf16, transformer_dir)
-
-                # Save config (copy from original transformer config and update _name_or_path)
-                config_file = transformer_dir / "config.json"
-                config_dict = dict(self.transformer.config)
-                config_dict.pop('_name_or_path', None)
-                with open(config_file, 'w') as f:
-                    json.dump(config_dict, f, indent=2)
-
-                # # Save optimizer state and training metadata in PyTorch format
-                # training_state_path = checkpoint_dir / "training_state.pt"
-                # logger.info(f"Saving training state to {training_state_path}")
-                # torch.save({
-                #     'step': self.step,
-                #     'optimizer_state_dict': optim_state,
-                #     'config': vars(self.config),
-                # }, training_state_path)
-
-                logger.info(f"Checkpoint saved successfully at step {self.step}")
-
-            # Synchronize all processes after saving
-            if dist.is_initialized():
-                dist.barrier()
-
-        except Exception as e:
-            if self.config.rank == 0:
-                logger.error(f"Failed to save checkpoint: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-            # Ensure all processes stay synchronized even on error
-            if dist.is_initialized():
-                dist.barrier()
+        """Save and verify all shards; retain live state and retry on I/O errors."""
+        return save_checkpoint_verified(self)
 
     def _load_training_state(self, checkpoint_path):
         """Load training state (optimizer + step) after FSDP and optimizer creation."""
@@ -818,6 +767,16 @@ class Trainer:
     def train(self):
         """Main training loop - train by steps instead of epochs."""
         logger.info(f"Starting training for {self.config.num_steps} steps...")
+        effective_batch = self.config.world_size * self.config.batch_size * self.gradient_accumulation_steps
+        logger.info(
+            "Training batch: world_size=%d per_rank_batch=%d gradient_accumulation=%d effective_batch=%d sync_each_microbatch=%s",
+            self.config.world_size, self.config.batch_size, self.gradient_accumulation_steps,
+            effective_batch, int(getattr(self.config, 'sync_each_microbatch', False)),
+        )
+        metrics_path = os.environ.get("ZERO_WAM_METRICS_PATH")
+        if metrics_path and self.config.rank == 0:
+            Path(metrics_path).parent.mkdir(parents=True, exist_ok=True)
+        step_started = time.perf_counter()
         self.transformer.train()
 
         progress_bar = tqdm(
@@ -885,6 +844,19 @@ class Trainer:
 
                 if self.config.rank == 0:
                     total_norm = losses['total_norm']
+                    step_seconds = time.perf_counter() - step_started
+                    if metrics_path:
+                        record = {
+                            'timestamp': time.time(), 'step': self.step + 1,
+                            'step_seconds': step_seconds, 'effective_batch': effective_batch,
+                            'gradient_accumulation_steps': self.gradient_accumulation_steps,
+                            'latent_loss': latent_loss_show, 'action_loss': action_loss_show,
+                            'mcp_loss': mcp_total_loss_show, 'grad_norm': total_norm.item(),
+                            'next_step_lr': lr, 'optimizer_step_skipped': losses['optimizer_step_skipped'],
+                            'gpu_peak_allocated_gib_rank0': torch.cuda.max_memory_allocated() / 2**30,
+                        }
+                        with open(metrics_path, 'a', encoding='utf-8') as metrics_file:
+                            metrics_file.write(json.dumps(record) + '\n')
                     progress_bar.n += 1
                     postfix = {
                         'latent_loss': f'{latent_loss_show:.4f}',
@@ -892,6 +864,7 @@ class Trainer:
                         'step': self.step,
                         'grad_norm': f'{total_norm.item():.2f}',
                         'lr': f'{lr:.2e}',
+                        'step_s': f'{step_seconds:.1f}',
                     }
                     if losses['optimizer_step_skipped']:
                         postfix['optimizer_step'] = 'skipped'
@@ -900,6 +873,11 @@ class Trainer:
                     progress_bar.set_postfix(postfix)
                     if self.config.enable_wandb:
                         log_values = {
+                            'performance/step_seconds': step_seconds,
+                            'performance/samples_per_second': effective_batch / step_seconds,
+                            'train/effective_batch_size': effective_batch,
+                            'train/optimizer_step': self.step + 1,
+                            'train/optimizer_step_skipped': int(losses['optimizer_step_skipped']),
                             'loss_metrics/global_avg_video_loss': latent_loss_show,
                             'loss_metrics/global_avg_action_loss': action_loss_show,
                             'loss_metrics/global_max_video_loss': max_latent_loss_show,
@@ -915,7 +893,7 @@ class Trainer:
                                 log_values[
                                     f'loss_metrics/mcp_depth_{depth + 1}'] = (
                                         mcp_loss_show)
-                        self.wandb.log(log_values, step=self.step)
+                        self.wandb.log(log_values, step=self.step + 1)
                 
                 self.step += 1
                 
@@ -923,6 +901,7 @@ class Trainer:
                     if self.config.rank == 0:
                         logger.info(f"Starting save model at step {self.step}")
                     self.save_checkpoint()
+                step_started = time.perf_counter()
 
             if dist.is_initialized():
                 dist.barrier()
@@ -931,8 +910,8 @@ class Trainer:
         logger.info("Training completed!")
 
 
-def run(args):
-    """Main entry point."""
+def build_training_config(args):
+    """Resolve CLI overrides and data sources without initializing CUDA or W&B."""
     config = deepcopy(VA_CONFIGS[args.config_name])
 
     overrides = {
@@ -954,12 +933,29 @@ def run(args):
             config[key] = value
     config.cfg_prob = config.droptext_target
 
+    if args.enable_wandb:
+        config.enable_wandb = True
     if args.disable_wandb:
         config.enable_wandb = False
 
+    if 'ZERO_WAM_SYNC_EACH_MICROBATCH' in os.environ:
+        value = os.environ['ZERO_WAM_SYNC_EACH_MICROBATCH']
+        if value not in ('0', '1'):
+            raise ValueError('ZERO_WAM_SYNC_EACH_MICROBATCH must be 0 or 1')
+        config.sync_each_microbatch = value == '1'
+
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    check_config = getattr(args, 'check_config', False)
+    expected_world_size = getattr(config, 'expected_world_size', None)
+    default_world_size = (expected_world_size or 1) if check_config else 1
+    world_size = int(os.environ.get('WORLD_SIZE', default_world_size))
+    if expected_world_size is not None and world_size != expected_world_size:
+        raise ValueError(f'{args.config_name} requires {expected_world_size} GPUs, got WORLD_SIZE={world_size}')
+    effective_batch = world_size * config.batch_size * config.gradient_accumulation_steps
+    expected_batch = getattr(config, 'expected_effective_batch_size', None)
+    if expected_batch is not None and effective_batch != expected_batch:
+        raise ValueError(f'{args.config_name} requires global batch {expected_batch}, got {effective_batch}')
     config.rank = rank
     config.local_rank = local_rank
     config.world_size = world_size
@@ -971,6 +967,52 @@ def run(args):
         local_rank=local_rank,
         world_size=world_size,
     )
+    if getattr(config, 'task_selection_dataset', None) is not None:
+        names = [source['name'] for source in config.dataset_sources]
+        if names != [config.task_selection_dataset]:
+            raise ValueError(f'{args.config_name} requires --datasets {config.task_selection_dataset}:1.0')
+    return config
+
+
+def training_config_report(config):
+    """Inspect the exact dataset configs that the Trainer will construct."""
+    from .dataset.icl_lerobot_latent_dataset import _icl_repo_list, _partition_icl_repos
+
+    sources = []
+    for source in config.dataset_sources:
+        dataset_config = source['config']
+        selected = _icl_repo_list(dataset_config)
+        _, excluded = _partition_icl_repos(dataset_config)
+        sources.append({
+            'name': source['name'], 'selected_task_count': len(selected),
+            'excluded_roots': len(excluded),
+            'training_tasks': [path.name.split('-', 1)[0] for path in selected],
+            'selected_roots': [str(path) for path in selected],
+            'excluded_task_names': dataset_config.excluded_task_names,
+        })
+    return {
+        'world_size': config.world_size,
+        'batch_size': config.batch_size,
+        'gradient_accumulation_steps': config.gradient_accumulation_steps,
+        'effective_batch_size': config.world_size * config.batch_size * config.gradient_accumulation_steps,
+        'num_steps': config.num_steps, 'save_interval': config.save_interval,
+        'learning_rate': config.learning_rate, 'warmup_steps': config.warmup_steps,
+        'sync_each_microbatch': getattr(config, 'sync_each_microbatch', False),
+        'enable_wandb': config.enable_wandb,
+        'wandb_project': os.getenv('WANDB_PROJECT', getattr(config, 'wandb_project', 'va_robotwin')),
+        'cpu_offload': os.getenv('ZERO_WAM_CPU_OFFLOAD', '0') == '1',
+        'activation_offload': os.getenv('ZERO_WAM_ACTIVATION_OFFLOAD', '0') == '1',
+        'dataset_sources': sources,
+    }
+
+
+def run(args):
+    """Common training entry point for full-task and subset configurations."""
+    config = build_training_config(args)
+    if getattr(args, 'check_config', False):
+        print(json.dumps(training_config_report(config), indent=2))
+        return
+    rank, local_rank, world_size = config.rank, config.local_rank, config.world_size
 
     init_distributed(world_size, local_rank, rank)
 
@@ -982,6 +1024,11 @@ def run(args):
     try:
         trainer = Trainer(config)
         trainer.train()
+    except BaseException:
+        # Report the original error before collective teardown, which can wait
+        # for peers that are still in a forward/backward collective.
+        logger.exception("Training failed on rank %d", rank)
+        raise
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -995,6 +1042,10 @@ def main():
         type=str,
         default='robotwin_train',
         help="Config name",
+    )
+    parser.add_argument(
+        '--check-config', action='store_true',
+        help='Validate the selected task split and recipe without initializing CUDA, model, or W&B',
     )
     parser.add_argument(
         "--datasets",
@@ -1031,6 +1082,11 @@ def main():
         type=str,
         default=None,
         help="Path to the empty-text embedding bundled with Zero-WAM",
+    )
+    parser.add_argument(
+        "--enable-wandb",
+        action="store_true",
+        help="Enable Weights & Biases logging using WANDB environment settings",
     )
     parser.add_argument(
         "--disable-wandb",

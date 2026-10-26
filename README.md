@@ -1,5 +1,7 @@
 <h1 align="center">Zero-WAM:<br>In-Context World-Action Modeling from Human Videos for Open-Ended Task Generalization</h1>
 
+> **Full-Robotwin 分支：** 四卡 43 任务 / 12 任务训练共用配置入口，启动命令见 [README.robotwin.md](README.robotwin.md)。
+
 <p align="center">
   <strong>
     <a href="https://jiaming-zhou.github.io/">Jiaming Zhou</a> &nbsp;
@@ -294,10 +296,12 @@ Human video ICL, bidirectional human-video attention, the action branch, and MCP
 
 ### Robotwin-only Post-training
 
-Start eight-GPU post-training using only Robotwin data:
+This branch uses four GPUs with gradient accumulation 2 (global batch 8).
+See [README.robotwin.md](README.robotwin.md) for the 12-task, 15,000-step configuration.
+Start full 43-task post-training using only Robotwin data:
 
 ```bash
-NGPU=8 \
+CONFIG_NAME=robotwin_train NGPU=4 \
 DATASETS="robotwin:1.0" \
 bash script/train.sh --init-worker 1
 ```
@@ -312,7 +316,7 @@ with an error if this isolation check fails.
 Start eight-GPU co-training with RoboTwin and all five Pre-training ICL (External) datasets:
 
 ```bash
-NGPU=8 \
+CONFIG_NAME=robotwin_mixed_train NGPU=8 \
 DATASETS="robotwin:1.0,agibot:1.0,robocoin:1.0,robomind:1.0,interna1:1.0,oxe:1.0" \
 bash script/train.sh --init-worker 1
 ```

@@ -1,10 +1,10 @@
 #!/usr/bin/bash
 
-set -x
+set -euo pipefail
 
 umask 007
  
-NGPU=${NGPU:-"8"}
+NGPU=${NGPU:-"4"}
 PYTHON_BIN=${PYTHON_BIN:-"python"}
 MASTER_PORT=${MASTER_PORT:-"29501"}
 PORT=${PORT:-"1106"}
@@ -15,11 +15,6 @@ DATASETS=${DATASETS:-"robotwin:1.0"}
 
 : "${MODEL_PATH:?Set MODEL_PATH to the released zero-wam-pretrain model root}"
 export MODEL_PATH
-
-overrides=""
-if [ $# -ne 0 ]; then
-    overrides="$*"
-fi
 
 ## node setting
 num_gpu=${NGPU}
@@ -37,4 +32,4 @@ PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" TORCHFT_LIGHTHOUSE=${torchft_
     --local-ranks-filter=${log_rank} \
     --master_port ${master_port} \
     --tee 3 \
-    -m wan_va.train --config-name ${config_name} --datasets "${datasets}" $overrides
+    -m wan_va.train --config-name "${config_name}" --datasets "${datasets}" "$@"
