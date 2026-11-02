@@ -9,6 +9,7 @@ directly.
 """
 
 import math
+import logging
 from copy import deepcopy
 from typing import Optional
 
@@ -28,6 +29,7 @@ from torch.nn.attention.flex_attention import (
 )
 
 from .model import WanRotaryPosEmbed, WanTimeTextImageEmbedding
+from .rgb_transition import RGBTransitionConditioner
 
 
 ICL_CACHE_TYPE = 2
@@ -36,6 +38,7 @@ OBSERVATION_CACHE_TYPE = 0
 
 _compiled_flex_attention = torch.compile(flex_attention, dynamic=True)
 _compiled_create_block_mask = torch.compile(create_block_mask)
+logger = logging.getLogger(__name__)
 
 
 def _apply_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -627,6 +630,8 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
         num_mcp_modules=4,
         mcp_blocks_per_group=1,
         mcp_hidden_collect_layers=(3, 11, 19, 29),
+        enable_rgb_transition=False,
+        rgb_transition_config=None,
     ):
         super().__init__()
         self.patch_size = tuple(patch_size)
@@ -635,6 +640,11 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
         self.inner_dim = num_attention_heads * attention_head_dim
         self.action_inner_dim = action_inner_dim
         self.attn_window = attn_window
+        self.enable_rgb_transition = bool(enable_rgb_transition)
+        self.rgb_transition = (
+            RGBTransitionConditioner(rgb_transition_config or {}, video_dim=self.inner_dim)
+            if self.enable_rgb_transition else None
+        )
 
         self.rope = WanRotaryPosEmbed(
             attention_head_dim, self.patch_size, rope_max_seq_len
@@ -722,6 +732,99 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
             torch.randn(1, 2, action_inner_dim) / action_inner_dim**0.5
         )
         self.clear_cache()
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        """Load an unchanged backbone, explicitly initializing only a new RGB branch.
+
+        Diffusers constructs models with initialization disabled (and often on
+        meta). Missing new parameters therefore cannot be used as initialized
+        weights, even when its load report calls them "newly initialized".
+        """
+        return_loading_info = kwargs.pop("output_loading_info", False)
+        model, loading_info = super().from_pretrained(
+            *args, output_loading_info=True, **kwargs
+        )
+        if model.enable_rgb_transition:
+            missing = set(loading_info.get("missing_keys", []))
+            new_keys = {
+                f"rgb_transition.{key}" for key in model.rgb_transition.state_dict()
+            }
+            invalid_missing = missing - new_keys
+            if (
+                invalid_missing
+                or loading_info.get("unexpected_keys")
+                or loading_info.get("mismatched_keys")
+                or loading_info.get("error_msgs")
+            ):
+                raise RuntimeError(
+                    "RGB-transition checkpoint does not match the backbone: "
+                    f"{loading_info}"
+                )
+            if missing:
+                if missing != new_keys:
+                    raise RuntimeError(
+                        "Refusing a partially missing RGB-transition checkpoint; "
+                        f"missing keys: {sorted(missing)}"
+                    )
+                if kwargs.get("device_map") is not None:
+                    raise ValueError(
+                        "Initialize the new RGB branch on CPU before device_map dispatch"
+                    )
+                reference = model.patch_embedding_mlp.weight
+                model.rgb_transition = RGBTransitionConditioner(
+                    dict(model.config.rgb_transition_config or {}),
+                    video_dim=model.inner_dim,
+                ).to(device=reference.device, dtype=reference.dtype)
+                model.rgb_transition.train(model.training)
+                logger.info(
+                    "Initialized %d new RGB-transition tensors; backbone loaded unchanged. "
+                    "Missing checkpoint keys: %s", len(missing), sorted(missing)
+                )
+            model.rgb_transition_loading_info = loading_info
+        return (model, loading_info) if return_loading_info else model
+
+    def _rgb_zero_losses(self):
+        # Different ranks can independently drop ICL. Keep every new parameter
+        # in the graph so these ranks still run matching FSDP reductions. Match
+        # FP32 auxiliary losses on other ranks, including metric all-reduces.
+        zero = sum(
+            parameter.reshape(-1)[0].float() * 0
+            for parameter in self.rgb_transition.parameters()
+            if parameter.requires_grad and parameter.numel()
+        )
+        if not torch.is_tensor(zero):
+            zero = self.patch_embedding_mlp.weight.new_zeros((), dtype=torch.float32)
+        return {"human_self": zero, "robot_self": zero, "transfer": zero, "total": zero}
+
+    def _fuse_rgb_transition(self, human_hidden, input_dict, *, compute_aux):
+        rgb_inputs = input_dict.get("rgb_transition")
+        if not isinstance(rgb_inputs, dict) or "human_features" not in rgb_inputs:
+            raise ValueError(
+                "RGB-transition conditioning is enabled but human_features are missing"
+            )
+        human_features = rgb_inputs["human_features"]
+        if not torch.is_tensor(human_features) or human_features.ndim != 5:
+            raise ValueError("human_features must have shape [B, S, T, P, D]")
+        human_features = human_features.to(
+            device=human_hidden.device, dtype=human_hidden.dtype
+        )
+        robot_features = rgb_inputs.get("robot_features") if compute_aux else None
+        if robot_features is not None:
+            robot_features = robot_features.to(
+                device=human_hidden.device, dtype=human_hidden.dtype
+            )
+        tokens, losses = self.rgb_transition(
+            human_features, robot_features=robot_features, compute_aux=compute_aux
+        )
+        fused = self.rgb_transition.fuse(human_hidden, tokens)
+        if compute_aux:
+            # Also connect any unused auxiliary parameters when a batch has no
+            # robot teacher, or an ordinary-feature control disables a loss.
+            zero = self._rgb_zero_losses()["total"]
+            losses = dict(losses)
+            losses["total"] = losses.get("total", zero) + zero
+        return fused, losses
 
     def disable_mcp_modules(self) -> None:
         self.enable_mcp = False
@@ -1036,11 +1139,16 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
         grid_parts = [latent["grid_id"][0], latent["grid_id"][0]]
 
         icl = input_dict.get("icl_latent_dict")
+        rgb_losses = self._rgb_zero_losses() if self.enable_rgb_transition else {}
         icl_length = 0
         if icl is not None:
             icl_hs, _, icl_timestep_proj = self._training_embed(
                 icl["latent"], icl["timesteps"], "video"
             )
+            if self.enable_rgb_transition:
+                icl_hs, rgb_losses = self._fuse_rgb_transition(
+                    icl_hs, input_dict, compute_aux=True
+                )
             icl_length = icl_hs.shape[1]
             latent_parts.append(icl_hs)
             latent_timestep_parts.append(icl_timestep_proj)
@@ -1197,9 +1305,13 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
             target_length=target_length,
             action_length=action_length,
         )
-        if self.enable_mcp:
-            return latent_output, action_output, mcp_outputs
-        return latent_output, action_output
+        base_pred = (
+            (latent_output, action_output, mcp_outputs)
+            if self.enable_mcp else (latent_output, action_output)
+        )
+        if self.enable_rgb_transition:
+            return {"base_pred": base_pred, "rgb_losses": rgb_losses}
+        return base_pred
 
     def _forward_stream(
         self,
@@ -1243,6 +1355,19 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
                 dtype=torch.int,
             ),
         ).to(device=device, dtype=torch.int)
+        if self.enable_rgb_transition and mode == "video":
+            human_queries = cache_types == ICL_CACHE_TYPE
+            if human_queries.any():
+                # The public server caches a complete human demonstration in a
+                # dedicated call. Reject mixed streams rather than accidentally
+                # conditioning target/CFG-negative queries on human RGB.
+                if not human_queries.all() or not (query_seq == 0).all():
+                    raise ValueError(
+                        "RGB-transition ICL caching requires a human-only, seq_id=0 stream"
+                    )
+                hidden_states, _ = self._fuse_rgb_transition(
+                    hidden_states, input_dict, compute_aux=False
+                )
         for name, value in (
             ("current_seq_ids", query_seq),
             ("current_frame_ids", query_frame),

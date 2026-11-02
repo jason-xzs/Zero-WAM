@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
+import hashlib
 from copy import deepcopy
 from contextlib import nullcontext
 import os
@@ -64,6 +65,13 @@ def _safe_mean(tensor):
     return tensor.sum() / max(tensor.numel(), 1)
 
 
+RGB_LOSS_COMPONENTS = tuple(
+    name + suffix
+    for name in ('human_self', 'robot_self', 'transfer')
+    for suffix in ('', '_l1', '_cosine')
+)
+
+
 _DATASET_PATH_OVERRIDES = (
     'dataset_path',
     'icl_manifest_path',
@@ -113,6 +121,11 @@ def _build_dataset_sources(config, args, rank, local_rank, world_size):
         for key in ('enable_dataset_index_cache', 'rebuild_dataset_index_cache'):
             if hasattr(config, key):
                 dataset_config[key] = config[key]
+        for key in ('enable_rgb_transition', 'rgb_feature_root',
+                    'rgb_transition_config', 'rgb_smoke_sample_ids',
+                    'rgb_encoder_id', 'rgb_encoder_revision', 'rgb_preprocessing'):
+            if hasattr(config, key):
+                dataset_config[key] = deepcopy(config[key])
 
         if getattr(dataset_config, 'load_robotwin_stats_from_dataset', False):
             action_stats_path = (
@@ -175,6 +188,7 @@ class Trainer:
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
         self.enable_mcp = getattr(config, 'enable_mcp', True)
+        self.enable_rgb_transition = bool(getattr(config, 'enable_rgb_transition', False))
         if int(config.batch_size) != 1:
             raise ValueError(
                 "Zero-WAM ICL training requires batch_size=1 per rank"
@@ -189,6 +203,11 @@ class Trainer:
 
         # Load models
         logger.info("Loading models...")
+        rgb_init_seed = int(getattr(config, 'rgb_init_seed', 42))
+        if self.enable_rgb_transition:
+            # FSDP2 does not broadcast newly initialized parameters. Every
+            # process must construct the new branch from identical RNG state.
+            torch.manual_seed(rgb_init_seed)
 
         # Load and shard transformer with FSDP
         logger.info("Loading transformer...")
@@ -200,6 +219,16 @@ class Trainer:
         else:
             transformer_path = self._resolve_transformer_path(config.model_path)
 
+        if self.enable_rgb_transition:
+            saved_config = json.loads((Path(transformer_path) / 'config.json').read_text())
+            if saved_config.get('enable_rgb_transition', False):
+                saved_rgb = saved_config.get('rgb_transition_config', {})
+                if saved_rgb != dict(config.rgb_transition_config):
+                    raise ValueError(
+                        'RGB checkpoint architecture/feature provenance differs from this run; '
+                        'do not silently override its RGB configuration'
+                    )
+
         self.transformer = load_transformer(
             transformer_path,
             torch_dtype=torch.float32,
@@ -210,7 +239,28 @@ class Trainer:
             num_mcp_modules=config.num_mcp_modules,
             mcp_blocks_per_group=config.mcp_blocks_per_group,
             mcp_hidden_collect_layers=tuple(config.mcp_hidden_collect_layers),
+            **({
+                'enable_rgb_transition': True,
+                'rgb_transition_config': dict(config.rgb_transition_config),
+            } if self.enable_rgb_transition else {}),
         )
+        if self.enable_rgb_transition:
+            digest = hashlib.sha256()
+            for name, tensor in self.transformer.rgb_transition.state_dict().items():
+                digest.update(name.encode())
+                digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+            checksum = digest.hexdigest()
+            checksums = [None] * config.world_size
+            if dist.is_initialized():
+                dist.all_gather_object(checksums, checksum)
+            else:
+                checksums = [checksum]
+            if len(set(checksums)) != 1:
+                raise RuntimeError(f'RGB initial parameters differ between ranks: {checksums}')
+            if config.rank == 0:
+                logger.info('RGB initial parameters agree across %d ranks: sha256=%s', config.world_size, checksum)
+            # Sampling/noise should subsequently be independent across ranks.
+            torch.manual_seed(rgb_init_seed + config.rank)
         if self.enable_mcp:
             validate_mcp_settings(
                 num_mcp_modules=config.num_mcp_modules,
@@ -531,6 +581,13 @@ class Trainer:
             'max_frame_chunk_size': int(self.config.max_frame_chunk_size),
             'window_size': window_size,
         }
+        if getattr(self, 'enable_rgb_transition', False) and use_icl:
+            # These are frozen RGB backbone features, not trainable adapter
+            # outputs. The conditioner executes inside the model's FSDP forward.
+            input_dict['rgb_transition'] = {
+                'human_features': batch_dict['rgb_human_features'],
+                'robot_features': batch_dict['rgb_robot_features'],
+            }
         if self.enable_mcp:
             mcp_latent_dicts = []
             for module_index in range(self.config.num_mcp_modules):
@@ -675,6 +732,12 @@ class Trainer:
             output = self.transformer(input_dict, train_mode=True)
         if first_batch:
             logger.info("First forward completed; computing losses and backward")
+        rgb_outputs = {}
+        if self.enable_rgb_transition:
+            if not isinstance(output, dict) or 'rgb_losses' not in output:
+                raise RuntimeError('RGB-enabled model must return RGB auxiliary losses')
+            rgb_outputs = output['rgb_losses']
+            output = output['base_pred']
         latent_loss, action_loss, mcp_losses = self.compute_loss(
             input_dict, output)
         mcp_loss = sum(
@@ -682,7 +745,15 @@ class Trainer:
             for weight, depth_loss in zip(
                 self.config.mcp_loss_weights, mcp_losses)
         ) if mcp_losses else latent_loss.new_zeros(())
-        loss = latent_loss + action_loss + mcp_loss
+        rgb_loss = latent_loss.new_zeros(())
+        if self.enable_rgb_transition:
+            rgb_loss = (
+                rgb_outputs['total'].float() * float(self.config.rgb_loss_weight)
+                / self.gradient_accumulation_steps
+            )
+            if not torch.isfinite(rgb_loss.detach()).all():
+                raise FloatingPointError('Non-finite RGB auxiliary loss')
+        loss = latent_loss + action_loss + mcp_loss + rgb_loss
 
         loss.backward()
         if first_batch:
@@ -693,6 +764,12 @@ class Trainer:
             'action_loss': action_loss.detach(),
             'mcp_losses': [depth_loss.detach() for depth_loss in mcp_losses],
             'mcp_loss': mcp_loss.detach(),
+            'rgb_loss': rgb_loss.detach(),
+            'rgb_components': {
+                key: rgb_outputs.get(key, rgb_loss.new_zeros(())).detach().float()
+                / self.gradient_accumulation_steps
+                for key in RGB_LOSS_COMPONENTS
+            } if self.enable_rgb_transition else {},
         }
         
         # Only update weights after accumulating gradients
@@ -720,6 +797,13 @@ class Trainer:
                 )
             self.lr_scheduler.step()
             self.optimizer.zero_grad()
+            if self.enable_rgb_transition:
+                # All ranks participate in DTensor materialization, not just
+                # the logging rank. This also exposes a stuck zero gate early.
+                gate = self.transformer.rgb_transition.gate.detach()
+                if hasattr(gate, 'full_tensor'):
+                    gate = gate.full_tensor()
+                losses['rgb_gate'] = float(gate.float().item())
             
             losses['total_norm'] = total_norm
             losses['optimizer_step_skipped'] = skip_optimizer_step
@@ -795,6 +879,8 @@ class Trainer:
             [] for _ in range(self.config.num_mcp_modules)
         ] if self.enable_mcp else []
         accumulated_mcp_total_losses = []
+        accumulated_rgb_losses = []
+        accumulated_rgb_components = {k: [] for k in RGB_LOSS_COMPONENTS}
         step_in_accumulation = 0
 
         while self.step < self.config.num_steps:
@@ -809,6 +895,9 @@ class Trainer:
             for depth, mcp_loss in enumerate(losses['mcp_losses']):
                 accumulated_mcp_losses[depth].append(mcp_loss)
             accumulated_mcp_total_losses.append(losses['mcp_loss'])
+            accumulated_rgb_losses.append(losses['rgb_loss'])
+            for key, value in losses['rgb_components'].items():
+                accumulated_rgb_components[key].append(value)
             step_in_accumulation += 1
 
             # Log and checkpoint when optimizer steps
@@ -827,6 +916,11 @@ class Trainer:
                 mcp_total_loss_show = dist_mean(
                     torch.stack(accumulated_mcp_total_losses).sum()
                 ).detach().cpu().item()
+                rgb_loss_show = dist_mean(torch.stack(accumulated_rgb_losses).sum()).detach().cpu().item()
+                rgb_component_shows = {
+                    key: dist_mean(torch.stack(values).sum()).detach().cpu().item()
+                    for key, values in accumulated_rgb_components.items() if values
+                }
 
                 # Clear accumulated losses
                 accumulated_latent_losses = []
@@ -835,6 +929,8 @@ class Trainer:
                     [] for _ in range(self.config.num_mcp_modules)
                 ] if self.enable_mcp else []
                 accumulated_mcp_total_losses = []
+                accumulated_rgb_losses = []
+                accumulated_rgb_components = {k: [] for k in RGB_LOSS_COMPONENTS}
                 step_in_accumulation = 0
 
                 torch.cuda.synchronize()
@@ -855,6 +951,9 @@ class Trainer:
                             'next_step_lr': lr, 'optimizer_step_skipped': losses['optimizer_step_skipped'],
                             'gpu_peak_allocated_gib_rank0': torch.cuda.max_memory_allocated() / 2**30,
                         }
+                        if self.enable_rgb_transition:
+                            record.update(rgb_loss=rgb_loss_show, rgb_gate=losses['rgb_gate'])
+                            record.update({f'rgb_{key}': value for key, value in rgb_component_shows.items()})
                         with open(metrics_path, 'a', encoding='utf-8') as metrics_file:
                             metrics_file.write(json.dumps(record) + '\n')
                     progress_bar.n += 1
@@ -870,6 +969,9 @@ class Trainer:
                         postfix['optimizer_step'] = 'skipped'
                     if self.enable_mcp:
                         postfix['mcp_loss'] = f'{mcp_total_loss_show:.4f}'
+                    if self.enable_rgb_transition:
+                        postfix['rgb_loss'] = f'{rgb_loss_show:.4f}'
+                        postfix['rgb_gate'] = f"{losses['rgb_gate']:.3g}"
                     progress_bar.set_postfix(postfix)
                     if self.config.enable_wandb:
                         log_values = {
@@ -893,6 +995,10 @@ class Trainer:
                                 log_values[
                                     f'loss_metrics/mcp_depth_{depth + 1}'] = (
                                         mcp_loss_show)
+                        if self.enable_rgb_transition:
+                            log_values['rgb/weighted_total'] = rgb_loss_show
+                            log_values['rgb/gate'] = losses['rgb_gate']
+                            log_values.update({f'rgb/{key}': value for key, value in rgb_component_shows.items()})
                         self.wandb.log(log_values, step=self.step + 1)
                 
                 self.step += 1
@@ -931,6 +1037,25 @@ def build_training_config(args):
     for key, value in overrides.items():
         if value is not None:
             config[key] = value
+    if getattr(args, 'rgb_feature_root', None) is not None:
+        config.rgb_feature_root = args.rgb_feature_root
+    smoke_ids = getattr(args, 'rgb_smoke_sample_ids', None)
+    if smoke_ids:
+        if not getattr(args, 'smoke_test', False):
+            raise ValueError('--rgb-smoke-sample-ids requires --smoke-test')
+        config.rgb_smoke_sample_ids = [item.strip() for item in smoke_ids.split(',') if item.strip()]
+        if not config.rgb_smoke_sample_ids:
+            raise ValueError('RGB smoke sample whitelist must not be empty')
+        if len(set(config.rgb_smoke_sample_ids)) != len(config.rgb_smoke_sample_ids):
+            raise ValueError('RGB smoke sample whitelist must not contain duplicates')
+    if getattr(args, 'smoke_test', False):
+        if args.num_steps is None or not 1 <= int(config.num_steps) <= 20:
+            raise ValueError('--smoke-test requires an explicit --num-steps between 1 and 20')
+        if not getattr(config, 'enable_rgb_transition', False):
+            raise ValueError('RGB smoke test requires an RGB-enabled configuration')
+        if not smoke_ids:
+            raise ValueError('--smoke-test requires an explicit training sample ID whitelist')
+        config.smoke_test = True
     config.cfg_prob = config.droptext_target
 
     if args.enable_wandb:
@@ -990,6 +1115,9 @@ def training_config_report(config):
             'selected_roots': [str(path) for path in selected],
             'excluded_task_names': dataset_config.excluded_task_names,
         })
+        if getattr(config, 'enable_rgb_transition', False):
+            from .dataset.rgb_feature_cache import validate_rgb_feature_cache
+            sources[-1]['rgb_features'] = validate_rgb_feature_cache(dataset_config)
     return {
         'world_size': config.world_size,
         'batch_size': config.batch_size,
@@ -1003,6 +1131,12 @@ def training_config_report(config):
         'cpu_offload': os.getenv('ZERO_WAM_CPU_OFFLOAD', '0') == '1',
         'activation_offload': os.getenv('ZERO_WAM_ACTIVATION_OFFLOAD', '0') == '1',
         'dataset_sources': sources,
+        'enable_rgb_transition': bool(getattr(config, 'enable_rgb_transition', False)),
+        'rgb_feature_root': getattr(config, 'rgb_feature_root', None),
+        'rgb_transition_config': getattr(config, 'rgb_transition_config', None),
+        'rgb_loss_weight': getattr(config, 'rgb_loss_weight', None),
+        'smoke_test': bool(getattr(config, 'smoke_test', False)),
+        'rgb_smoke_sample_ids': getattr(config, 'rgb_smoke_sample_ids', None),
     }
 
 
@@ -1022,6 +1156,34 @@ def run(args):
         logger.info(f"World size: {world_size}, Local rank: {local_rank}")
 
     try:
+        if getattr(config, 'enable_rgb_transition', False):
+            # Validate every selected pair before allocating the large model.
+            # Rank 0 reads the cache once; all peers receive success or failure.
+            preflight = [None]
+            if rank == 0:
+                try:
+                    from .dataset.rgb_feature_cache import validate_rgb_feature_cache
+                    preflight[0] = {'reports': [
+                        validate_rgb_feature_cache(source['config'])
+                        for source in config.dataset_sources
+                    ]}
+                except Exception as error:
+                    preflight[0] = {'error': f'{type(error).__name__}: {error}'}
+            if dist.is_initialized():
+                dist.broadcast_object_list(preflight, src=0)
+            if 'error' in preflight[0]:
+                raise RuntimeError(f"RGB feature preflight failed: {preflight[0]['error']}")
+            feature_specs = [report['feature_spec'] for report in preflight[0]['reports']]
+            if any(spec != feature_specs[0] for spec in feature_specs[1:]):
+                raise ValueError('RGB dataset sources must share the same frozen encoder and preprocessing')
+            # Save the actual validated teacher/preprocessing in the model
+            # checkpoint, so serving cannot silently use a different cache.
+            config.rgb_transition_config.update(feature_specs[0])
+            for source in config.dataset_sources:
+                source['config'].update(feature_specs[0])
+                source['config'].rgb_transition_config = deepcopy(config.rgb_transition_config)
+            if rank == 0:
+                logger.info('RGB feature preflight: %s', preflight[0]['reports'])
         trainer = Trainer(config)
         trainer.train()
     except BaseException:
@@ -1077,6 +1239,11 @@ def main():
     parser.add_argument("--icl-manifest-path", type=str, default=None)
     parser.add_argument("--human-latent-path", type=str, default=None)
     parser.add_argument("--robot-latent-path", type=str, default=None)
+    parser.add_argument('--rgb-feature-root', type=str, default=None)
+    parser.add_argument('--rgb-smoke-sample-ids', type=str, default=None,
+                        help='Comma-separated run:sample_id keys for an explicitly bounded smoke test')
+    parser.add_argument('--smoke-test', action='store_true',
+                        help='Require <=20 explicit optimizer steps and a training sample whitelist')
     parser.add_argument(
         "--empty-emb-path",
         type=str,

@@ -204,6 +204,14 @@ class ICLLeRobotLatentDataset(LatentLeRobotDataset):
                 and self._human_latent_candidate(sample).is_file()
             )
         ]
+        smoke_ids = getattr(config, "rgb_smoke_sample_ids", None)
+        if smoke_ids is not None:
+            from .rgb_feature_cache import rgb_pair_key
+            if not getattr(config, "enable_rgb_transition", False):
+                raise ValueError("rgb_smoke_sample_ids requires enable_rgb_transition")
+            smoke_ids = {str(value) for value in smoke_ids}
+            self.new_metas = [meta for meta in self.new_metas
+                              if rgb_pair_key(self._lookup_icl_sample(meta)) in smoke_ids]
         if not self.new_metas:
             raise ValueError(f"No manifest-matched ICL samples found in {self.root}")
 
@@ -317,6 +325,30 @@ class ICLLeRobotLatentDataset(LatentLeRobotDataset):
             icl_sample_id=str(sample.get("sample_id", "")),
             icl_human_latent_path=str(human_latent_file),
         )
+        if getattr(self.config, "enable_rgb_transition", False):
+            from .rgb_feature_cache import (
+                DEFAULT_ENCODER_ID, check_feature_sources, check_robot_alignment, human_feature_path,
+                load_feature_cache, robot_feature_path,
+            )
+            root = self.config.rgb_feature_root
+            expected = dict(expected_encoder_id=getattr(self.config, "rgb_encoder_id", DEFAULT_ENCODER_ID),
+                            expected_revision=getattr(self.config, "rgb_encoder_revision", None),
+                            expected_sample_id=str(sample["sample_id"]))
+            human = load_feature_cache(human_feature_path(root, human_latent_file), "human", **expected)
+            robot = load_feature_cache(robot_feature_path(root, self.root.name, self.used_video_keys[0], meta), "robot", **expected)
+            latent_payload = torch.load(self._latent_file(meta, self.used_video_keys[0]), map_location="cpu", weights_only=False)
+            check_robot_alignment(robot, latent_payload, expected_sample_id=sample["sample_id"])
+            check_feature_sources(human, robot, human_video_path=sample["human_video_path"],
+                                  robot_latent_path=self._latent_file(meta, self.used_video_keys[0]))
+            if robot["features"].shape[0] != item["latents"].shape[1]:
+                raise ValueError("RGB robot timeline differs from item latent timeline")
+            if human["metadata"]["preprocessing"] != robot["metadata"]["preprocessing"]:
+                raise ValueError("Human/robot RGB preprocessing mismatch")
+            expected_preprocessing = getattr(self.config, "rgb_preprocessing", None)
+            if expected_preprocessing is not None and human["metadata"]["preprocessing"] != expected_preprocessing:
+                raise ValueError("RGB preprocessing differs from the saved model config")
+            item.update(rgb_human_features=human["features"], rgb_robot_features=robot["features"],
+                        rgb_human_frame_indices=human["frame_indices"], rgb_robot_frame_indices=robot["frame_indices"])
         return item
 
 

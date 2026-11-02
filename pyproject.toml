@@ -58,7 +58,7 @@ repository = "https://github.com/robbyant-research/Zero-WAM"
 include-package-data = true
 
 [tool.setuptools.package-data]
-wan_va = ["assets/*.pt", "assets/norm_stats/*.json"]
+wan_va = ["assets/*.pt", "assets/norm_stats/*.json", "modules/third_party/wala/LICENSE", "modules/third_party/wala/NOTICE.md"]
 
 [tool.setuptools.packages.find]
 include = ["wan_va*"]

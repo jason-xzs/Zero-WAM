@@ -527,6 +527,12 @@ class VA_Server:
         return latent, None
 
     def _cache_icl_context(self, video_path, latent_path):
+        rgb_features = None
+        if getattr(self.transformer, "enable_rgb_transition", False):
+            # RGB features are consumed only while creating the persistent human
+            # KV cache. Target/action calls (including CFG-negative sequences)
+            # never receive this extra condition.
+            rgb_features = self._load_rgb_icl_features(latent_path or video_path)
         latent, text_emb = self._load_or_encode_icl(video_path, latent_path)
         expected_channels = len(self.vae.config.latents_mean)
         if latent.shape[1] != expected_channels:
@@ -570,6 +576,8 @@ class VA_Server:
             ),
             "text_emb": text_emb.to(device=self.device, dtype=self.dtype),
         }
+        if rgb_features is not None:
+            input_dict["rgb_transition"] = {"human_features": rgb_features}
         self.transformer(
             input_dict,
             update_cache=1,
@@ -577,6 +585,42 @@ class VA_Server:
             mode="forward_latent_only",
         )
         logger.info(f"[ICL] persistent cache: {self.transformer.cache_counts()}")
+
+    def _load_rgb_icl_features(self, human_path):
+        from .dataset.rgb_feature_cache import human_feature_path, load_feature_cache
+
+        root = (getattr(self.job_config, "rgb_feature_root", None)
+                or os.environ.get("ZERO_WAM_RGB_FEATURE_ROOT")
+                or os.environ.get("RGB_FEATURE_ROOT"))
+        if not root:
+            raise ValueError(
+                "This checkpoint requires RGB human features: set rgb_feature_root "
+                "or ZERO_WAM_RGB_FEATURE_ROOT"
+            )
+        if not human_path:
+            raise ValueError("An ICL latent/video path is required to locate RGB features")
+        model_config = getattr(self.transformer, "config", None)
+        rgb_config = getattr(model_config, "rgb_transition_config", None) or {}
+        # The trained checkpoint defines the feature space. Runtime config can
+        # supply metadata for old checkpoints, but cannot silently replace it.
+        def expected(key):
+            value = rgb_config.get(key)
+            return value if value is not None else getattr(self.job_config, key, None)
+
+        feature_path = human_feature_path(root, human_path)
+        payload = load_feature_cache(
+            feature_path, "human",
+            expected_encoder_id=expected("rgb_encoder_id"),
+            expected_revision=expected("rgb_encoder_revision"),
+        )
+        preprocessing = expected("rgb_preprocessing")
+        if preprocessing is not None and payload["metadata"]["preprocessing"] != preprocessing:
+            raise ValueError(f"RGB cache preprocessing does not match checkpoint: {feature_path}")
+        features = payload["features"].unsqueeze(0).to(
+            device=self.device, dtype=self.dtype
+        )
+        logger.info("[ICL] loaded RGB features=%s from %s", tuple(features.shape), feature_path)
+        return features
 
     def _reset_icl(
         self,
@@ -1231,6 +1275,8 @@ def run(args):
     port = config.port if args.port is None else args.port
     if args.save_root is not None:
         config.save_root = args.save_root
+    if getattr(args, "rgb_feature_root", None):
+        config.rgb_feature_root = args.rgb_feature_root
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -1271,6 +1317,11 @@ def main():
         type=str,
         default=None,
         help='save root'
+    )
+    parser.add_argument(
+        "--rgb-feature-root", default=(os.environ.get("ZERO_WAM_RGB_FEATURE_ROOT")
+                                       or os.environ.get("RGB_FEATURE_ROOT")),
+        help="RGB feature cache root required by an RGB-transition checkpoint",
     )
     args = parser.parse_args()
     run(args)

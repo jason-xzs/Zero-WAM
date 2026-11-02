@@ -1,5 +1,7 @@
 # Full-Robotwin：四卡训练与子集实验
 
+`RGB-Transition-ICL` 分支的新增 RGB 表征实验见 [README.rgb-transition.md](README.rgb-transition.md)。下文描述其继承的 Full-Robotwin 基线；新增模型结构和验证结果以新文档为准。
+
 本分支统一使用 `wan_va.train`。43 任务和 12 任务只通过配置文件切换，没有独立的子集训练脚本，也不需要 `local/subset12/` 或迁移包。
 
 本文假设环境、数据和初始化权重已经准备好，只说明训练与推理配置。
