@@ -1,5 +1,7 @@
 # RGB transition：12 任务实验版本
 
+B300 单卡迁移使用 `robotwin_subset12_rgb_b300` 和 `script/train_rgb_b300.sh`：单卡 batch 1、累积 8、全局 batch 8。参数对照、缓存迁移和启动方式见 [README.rgb-b300.md](README.rgb-b300.md)。
+
 本分支 `RGB-Transition-ICL` 基于 `Full-Robotwin` 的 `53999f2`，沿用 [README.robotwin.md](README.robotwin.md) 的 12 任务训练、7 个未见任务测评、4 卡全局 batch 8、IFP/MCP 和 15,000 步预算。新增配置为 `robotwin_subset12_rgb_train`。原 `robotwin_subset12_train` 可继续运行基线。
 
 这是可检验的第一版假设：对 human/robot RGB 使用相同冻结表征，以“当前特征 → 未来特征变化”的预测目标训练 human 示范 token，再把它接入原 Zero-WAM 条件。短程检查验证实现和训练链路，不能证明未见任务成功率提升。

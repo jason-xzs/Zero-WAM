@@ -1125,6 +1125,8 @@ def training_config_report(config):
         'effective_batch_size': config.world_size * config.batch_size * config.gradient_accumulation_steps,
         'num_steps': config.num_steps, 'save_interval': config.save_interval,
         'learning_rate': config.learning_rate, 'warmup_steps': config.warmup_steps,
+        'load_worker': config.load_worker,
+        'rgb_init_seed': getattr(config, 'rgb_init_seed', 42) if getattr(config, 'enable_rgb_transition', False) else None,
         'sync_each_microbatch': getattr(config, 'sync_each_microbatch', False),
         'enable_wandb': config.enable_wandb,
         'wandb_project': os.getenv('WANDB_PROJECT', getattr(config, 'wandb_project', 'va_robotwin')),

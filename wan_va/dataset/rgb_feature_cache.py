@@ -7,6 +7,7 @@ No RGB features are inferred from VAE latents or from future robot inputs.
 from pathlib import Path
 import hashlib
 import posixpath
+import re
 
 import torch
 
@@ -109,11 +110,37 @@ def check_feature_limits(human, robot, limits):
         raise ValueError("RGB human frames_per_clip does not match model config")
 
 
+def _robot_latent_identity(path):
+    """Ignore only the storage root of a recognized RoboTwin latent layout.
+
+    The full task directory (including its variant), chunk, camera and episode
+    interval remain part of the identity. Unknown layouts are not portable by
+    basename: their original path must still match exactly.
+    """
+    parts = Path(path).parts
+    if len(parts) < 5 or ".." in parts:
+        return None
+    task, directory, chunk, camera, filename = parts[-5:]
+    if (
+        directory != "latents"
+        or re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", task) is None
+        or re.fullmatch(r"chunk-[0-9]{3,}", chunk) is None
+        or re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", camera) is None
+        or re.fullmatch(r"episode_[0-9]{6,}_[0-9]+_[0-9]+\.pth", filename) is None
+    ):
+        return None
+    return task, directory, chunk, camera, filename
+
+
 def check_feature_sources(human, robot, *, human_video_path, robot_latent_path):
     if human_relative_path(human["metadata"]["source_video_path"]) != human_relative_path(human_video_path):
         raise ValueError("RGB human source video differs from the selected manifest pair")
-    if Path(robot["metadata"].get("source_latent_path", "")) != Path(robot_latent_path):
-        raise ValueError("RGB robot source latent differs from the selected interval")
+    original_path = Path(robot["metadata"].get("source_latent_path", ""))
+    current_path = Path(robot_latent_path)
+    if original_path != current_path:
+        original_identity = _robot_latent_identity(original_path)
+        if original_identity is None or original_identity != _robot_latent_identity(current_path):
+            raise ValueError("RGB robot source latent differs from the selected interval")
 
 
 def expected_rgb_records(config):

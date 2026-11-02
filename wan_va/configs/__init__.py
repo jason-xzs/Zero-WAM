@@ -7,6 +7,7 @@ from .va_robotwin_train_cfg import va_robotwin_train_cfg
 from .va_robotwin_full_train_cfg import va_robotwin_full_train_cfg
 from .va_robotwin_subset12_train_cfg import va_robotwin_subset12_train_cfg
 from .va_robotwin_subset12_rgb_train_cfg import va_robotwin_subset12_rgb_train_cfg
+from .va_robotwin_subset12_rgb_b300_cfg import va_robotwin_subset12_rgb_b300_cfg
 from .va_agibot_train_cfg import va_agibot_train_cfg
 from .va_robocoin_train_cfg import va_robocoin_train_cfg
 from .va_robomind_train_cfg import va_robomind_train_cfg
@@ -23,6 +24,7 @@ VA_CONFIGS = {
     'robotwin_train': va_robotwin_full_train_cfg,
     'robotwin_subset12_train': va_robotwin_subset12_train_cfg,
     'robotwin_subset12_rgb_train': va_robotwin_subset12_rgb_train_cfg,
+    'robotwin_subset12_rgb_b300': va_robotwin_subset12_rgb_b300_cfg,
     # Keep the original generic recipe for the upstream multi-dataset example.
     'robotwin_mixed_train': va_robotwin_train_cfg,
     'agibot_train': va_agibot_train_cfg,

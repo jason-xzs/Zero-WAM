@@ -102,7 +102,9 @@ def select_inputs(args):
     frame_ids = [int(value) for value in metadata["source_latent_frame_ids"][:5]]
     if len(frame_ids) != 5:
         raise ValueError("Need five real raw frames: initial observation plus one four-frame cache update")
-    main_video = Path(metadata["source_video_path"])
+    # Cached metadata records where features were originally extracted. Resolve
+    # runtime input through the current dataset record after moving servers.
+    main_video = Path(first["robot_video_path"])
     camera_paths = {camera: main_video.parent.parent / camera / main_video.name for camera in cfg.obs_cam_keys}
     decoded = {}
     for camera, path in camera_paths.items():

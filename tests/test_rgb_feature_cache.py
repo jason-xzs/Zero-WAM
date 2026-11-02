@@ -110,6 +110,102 @@ def test_source_identity_rejects_another_pair_with_same_numeric_id():
                               robot_latent_path="/workspace/task/episode_2.pth")
 
 
+_ROBOT_LATENT_SUFFIX = (
+    "place_bread_skillet-demo_clean_collect_200-1000/latents/chunk-000/"
+    "observation.images.cam_high/episode_000123_0_128.pth"
+)
+
+
+def test_robot_cache_remains_valid_after_relocating_dataset_root():
+    human = {"metadata": {"source_video_path": "/workspace/human/run_1/a.mp4"}}
+    robot = {"metadata": {"source_latent_path": "/workspace/HumanGen/robotwin_data/" + _ROBOT_LATENT_SUFFIX}}
+    check_feature_sources(
+        human, robot, human_video_path="/cluster/data/human/run_1/a.mp4",
+        robot_latent_path="/cluster/new-host/robot_latents/" + _ROBOT_LATENT_SUFFIX,
+    )
+
+
+@pytest.mark.parametrize("old,new", [
+    ("place_bread_skillet", "place_can_basket"),
+    ("demo_clean_collect_200-1000", "demo_randomized_collect_200-1000"),
+    ("chunk-000", "chunk-001"),
+    ("cam_high", "cam_left_wrist"),
+    ("episode_000123", "episode_000124"),
+    ("_0_128.pth", "_16_128.pth"),
+    ("_0_128.pth", "_0_144.pth"),
+])
+def test_relocated_robot_cache_keeps_complete_interval_identity(old, new):
+    human = {"metadata": {"source_video_path": "/workspace/human/run_1/a.mp4"}}
+    robot = {"metadata": {"source_latent_path": "/workspace/data/" + _ROBOT_LATENT_SUFFIX}}
+    with pytest.raises(ValueError, match="source latent"):
+        check_feature_sources(
+            human, robot, human_video_path="/cluster/human/run_1/a.mp4",
+            robot_latent_path="/cluster/data/" + _ROBOT_LATENT_SUFFIX.replace(old, new),
+        )
+
+
+@pytest.mark.parametrize("suffix", [
+    "task/episode_000123_0_128.pth",
+    "task/latents/unknown-layout/cam/episode_000123_0_128.pth",
+    "task/latents/chunk-000/cam/episode_000123.pth",
+    "task/../task/latents/chunk-000/cam/episode_000123_0_128.pth",
+])
+def test_unknown_robot_layout_still_requires_exact_source_path(suffix):
+    human = {"metadata": {"source_video_path": "/workspace/human/run_1/a.mp4"}}
+    robot = {"metadata": {"source_latent_path": "/workspace/data/" + suffix}}
+    check_feature_sources(human, robot, human_video_path="run_1/a.mp4",
+                          robot_latent_path="/workspace/data/" + suffix)
+    with pytest.raises(ValueError, match="source latent"):
+        check_feature_sources(human, robot, human_video_path="run_1/a.mp4",
+                              robot_latent_path="/cluster/data/" + suffix)
+
+
+def test_inference_inputs_use_relocated_videos_not_provenance_paths(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from PIL import Image
+    from wan_va.configs import VA_CONFIGS
+    import wan_va.dataset.rgb_feature_cache as cache_module
+    import tools.prepare_rgb_transition_features as preparation
+    from tools.smoke_rgb_inference import select_inputs
+
+    root = tmp_path / "new_server/HumanGen"
+    records = []
+    for sid in (1, 2):
+        sample = {"sample_id": sid, "human_video_path": f"human_data/robotwin/run_1/{sid}/video.mp4",
+                  "robot_video_path": f"task/videos/chunk-000/observation.images.cam_high/episode_{sid:06d}.mp4",
+                  "robot_task_name": "Move the object"}
+        human_path, robot_path = tmp_path / f"human_{sid}.pth", tmp_path / f"robot_{sid}.pth"
+        _write_cache(human_path, "human", frame_indices=[[0, 1], [2, 3]], sample_id=sid)
+        _write_cache(robot_path, sample_id=sid, source_video_path=f"/old_server/{sample['robot_video_path']}",
+                     source_latent_frame_ids=[0, 4, 8, 12, 16])
+        latent = root / f"human_latents/robotwin/run_1/{sid}/video.pth"
+        latent.parent.mkdir(parents=True)
+        latent.touch()
+        current_video = root / "robotwin_data" / sample["robot_video_path"]
+        for camera in VA_CONFIGS["robotwin_subset12_rgb_train"].obs_cam_keys:
+            path = current_video.parent.parent / camera / current_video.name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+        records.append({"sample": sample, "human_cache_path": human_path, "robot_cache_path": robot_path,
+                        "robot_video_path": current_video, "task_name": "task"})
+    monkeypatch.setattr(cache_module, "expected_rgb_records", lambda cfg: records)
+    decoded_paths = []
+
+    def decode(path, ids):
+        decoded_paths.append(path)
+        assert path.is_relative_to(root)
+        assert ids == [0, 4, 8, 12, 16]
+        return [Image.new("RGB", (8, 8)) for _ in ids]
+
+    monkeypatch.setattr(preparation, "decode_rgb_frames", decode)
+    args = SimpleNamespace(data_config="robotwin_subset12_rgb_train", human_gen_root=str(root),
+                           feature_root=str(tmp_path / "features"), sample_id=None, second_sample_id=None)
+    first, _, _, observations, evidence = select_inputs(args)
+    assert len(decoded_paths) == 3 and len(observations) == 5
+    assert first["robot_metadata"]["source_video_path"].startswith("/old_server/")
+    assert all(str(root) in path for path in evidence["camera_videos"].values())
+
+
 def test_full_rgb_resize_preserves_edges():
     from PIL import Image
     # The real processor config; no model or GPU is needed for this check.
