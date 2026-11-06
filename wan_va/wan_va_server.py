@@ -634,6 +634,7 @@ class VA_Server:
         if not prompt:
             raise ValueError("Robotwin ICL inference requires a prompt")
         self.chunk_idx = 0
+        self.readout_observation_latent = None
         self.init_latent = None
         self.last_predicted_latents = None
         self.last_predicted_actions = None
@@ -776,11 +777,17 @@ class VA_Server:
             grid_key: grid_id,
         }
         self._pack_icl_cfg(input_dict, mode, cache_type)
+        if mode == "video" and getattr(self.transformer, "uses_rgb_readout", False):
+            # This comes from the actual observation, never a generated chunk.
+            state = getattr(self, "readout_observation_latent", None)
+            if state is not None:
+                input_dict["readout_state_latent"] = state
         return input_dict
 
     def _infer_icl(self, obs):
         if self.chunk_idx == 0:
             self.init_latent = self._encode_initial_obs(obs)
+            self.readout_observation_latent = self.init_latent[:, :, -1:].detach().clone()
         latents = torch.randn(
             1,
             48,
@@ -925,6 +932,9 @@ class VA_Server:
             mode="forward_action_only",
             clean_window_cache=True,
         )
+        # The history just cached was conditioned on the preceding observation.
+        # Only subsequent predictions may read the newly observed final frame.
+        self.readout_observation_latent = latent_input[:, :, -1:].detach().clone()
         self.chunk_idx += 1
         logger.info(f"[ICL] cache after observation: {self.transformer.cache_counts()}")
 

@@ -90,6 +90,7 @@ def save_checkpoint_verified(trainer):
                     "tensor_count": len(state_dict_bf16),
                     "parameter_count": sum(t.numel() for t in state_dict_bf16.values()),
                     "weights_only": True,
+                    "training_provenance": getattr(trainer, "training_provenance", {}),
                     "files": files,
                 }
                 write_verified(checkpoint_dir / "COMPLETE.json", json.dumps(manifest, indent=2).encode())

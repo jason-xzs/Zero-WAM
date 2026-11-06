@@ -797,7 +797,11 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
             zero = self.patch_embedding_mlp.weight.new_zeros((), dtype=torch.float32)
         return {"human_self": zero, "robot_self": zero, "transfer": zero, "total": zero}
 
-    def _fuse_rgb_transition(self, human_hidden, input_dict, *, compute_aux):
+    @property
+    def uses_rgb_readout(self):
+        return self.enable_rgb_transition and self.rgb_transition.readout_mode != "human"
+
+    def _encode_rgb_transition(self, human_hidden, input_dict, *, compute_aux):
         rgb_inputs = input_dict.get("rgb_transition")
         if not isinstance(rgb_inputs, dict) or "human_features" not in rgb_inputs:
             raise ValueError(
@@ -817,19 +821,113 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
         tokens, losses = self.rgb_transition(
             human_features, robot_features=robot_features, compute_aux=compute_aux
         )
-        fused = self.rgb_transition.fuse(human_hidden, tokens)
         if compute_aux:
             # Also connect any unused auxiliary parameters when a batch has no
             # robot teacher, or an ordinary-feature control disables a loss.
             zero = self._rgb_zero_losses()["total"]
             losses = dict(losses)
             losses["total"] = losses.get("total", zero) + zero
-        return fused, losses
+        return tokens, losses
+
+    def _fuse_rgb_transition(self, human_hidden, input_dict, *, compute_aux):
+        tokens, losses = self._encode_rgb_transition(
+            human_hidden, input_dict, compute_aux=compute_aux
+        )
+        return self.rgb_transition.fuse(human_hidden, tokens), losses
+
+    def _training_rgb_readout(self, noisy, clean, memory, input_dict):
+        """Read each chunk from its preceding observed frame, never its future.
+
+        The first chunk has the recorded initial observation (frame zero), as
+        in server inference. All later chunks use frame start-1. Clean/history
+        tokens get the same causal conditioning as their noisy counterparts.
+        """
+        stream = input_dict["latent_dict"]
+        grid = stream["grid_id"][0]
+        frame_count = stream["latent"].shape[2]
+        if self.patch_size[0] != 1:
+            raise ValueError("RGB readout requires temporal patch size 1")
+        patches = clean.shape[1] // frame_count
+        if patches * frame_count != clean.shape[1]:
+            raise ValueError("Invalid RGB readout frame/patch layout")
+        observation_latents = input_dict.get("readout_observation_latents")
+        if not torch.is_tensor(observation_latents):
+            raise ValueError("RGB readout requires original clean readout_observation_latents")
+        if tuple(observation_latents.shape) != tuple(stream["latent"].shape):
+            raise ValueError("readout_observation_latents must match the robot latent layout")
+        # Backbone history may receive conditional-noise augmentation. The
+        # readout instead observes the original clean frame, as deployment does.
+        observation_states = rearrange(
+            observation_latents.to(self.patch_embedding_mlp.weight),
+            "b c f (h p2) (w p3) -> b (f h w) (c p2 p3)",
+            p2=self.patch_size[1], p3=self.patch_size[2],
+        )
+        observation_states = self.patch_embedding_mlp(observation_states).reshape(
+            1, frame_count, patches, self.inner_dim)
+        clean_frames = clean.reshape(1, frame_count, patches, self.inner_dim)
+        noisy_frames = noisy.reshape_as(clean_frames)
+        chunk = int(input_dict["chunk_size"])
+        teacher_targets = input_dict.get("readout_teacher_targets")
+        teacher_valid = input_dict.get("readout_teacher_valid")
+        expected_chunks = (frame_count + chunk - 1) // chunk
+        if teacher_targets is not None:
+            expected = (expected_chunks, self.rgb_transition.readout.num_tokens,
+                        self.rgb_transition.hidden_dim)
+            if tuple(teacher_targets.shape) != expected or teacher_valid is None:
+                raise ValueError("Future teacher targets do not match readout chunks")
+            if tuple(teacher_valid.shape) != (expected_chunks,):
+                raise ValueError("Future teacher validity does not match chunks")
+        new_noisy, new_clean, alignments = [], [], []
+        for index, start in enumerate(range(0, frame_count, chunk)):
+            end = min(start + chunk, frame_count)
+            observed = max(start - 1, 0)
+            state = observation_states[:, observed]
+            positions = grid[1:3, observed * patches:(observed + 1) * patches].T
+            tokens = self.rgb_transition.read_tokens(memory, state, positions)
+            new_noisy.append(self.rgb_transition.fuse(
+                noisy_frames[:, start:end].flatten(1, 2), tokens))
+            new_clean.append(self.rgb_transition.fuse(
+                clean_frames[:, start:end].flatten(1, 2), tokens))
+            if teacher_targets is not None and bool(teacher_valid[index]):
+                target = teacher_targets[index:index + 1].detach().float()
+                alignments.append((1 - F.cosine_similarity(
+                    tokens.float(), target, dim=-1, eps=1e-6)).mean())
+        alignment = (torch.stack(alignments).mean() if alignments
+                     else memory.float().sum() * 0)
+        return torch.cat(new_noisy, 1), torch.cat(new_clean, 1), alignment
+
+    def _inference_rgb_readout(self, hidden, input_dict, grid, seq_ids):
+        if self.rgb_readout_memory is None:
+            return hidden
+        positive = seq_ids == 0
+        if not bool(positive.any()):
+            return hidden
+        state_latent = input_dict.get("readout_state_latent")
+        if state_latent is None:
+            raise ValueError("RGB readout requires an actual observed readout_state_latent")
+        if state_latent.ndim != 5 or state_latent.shape[0] != 1 or state_latent.shape[2] != 1:
+            raise ValueError("readout_state_latent must contain exactly one observed frame")
+        state = rearrange(
+            state_latent.to(self.patch_embedding_mlp.weight),
+            "b c f (h p2) (w p3) -> b (f h w) (c p2 p3)",
+            p2=self.patch_size[1], p3=self.patch_size[2],
+        )
+        state = self.patch_embedding_mlp(state)
+        # The first spatial grid within the positive stream matches its state.
+        positions = grid[1:3, positive][:, :state.shape[1]].T
+        if positions.shape[0] != state.shape[1]:
+            raise ValueError("Readout observation and target camera grids differ")
+        tokens = self.rgb_transition.read_tokens(self.rgb_readout_memory, state, positions)
+        # Keep CFG-negative hidden states bitwise untouched, including packed CFG.
+        result = hidden.clone()
+        result[:, positive] = self.rgb_transition.fuse(hidden[:, positive], tokens)
+        return result
 
     def disable_mcp_modules(self) -> None:
         self.enable_mcp = False
 
     def clear_cache(self, cache_name: str = "pos") -> None:
+        self.rgb_readout_memory = None
         self.type_ids_cache = None
         self.seq_ids_cache = None
         self.frame_ids_cache = None
@@ -1146,9 +1244,17 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
                 icl["latent"], icl["timesteps"], "video"
             )
             if self.enable_rgb_transition:
-                icl_hs, rgb_losses = self._fuse_rgb_transition(
-                    icl_hs, input_dict, compute_aux=True
-                )
+                if self.uses_rgb_readout:
+                    memory, rgb_losses = self._encode_rgb_transition(
+                        icl_hs, input_dict, compute_aux=True)
+                    target_noisy_hs, target_clean_hs, alignment = self._training_rgb_readout(
+                        target_noisy_hs, target_clean_hs, memory, input_dict)
+                    latent_parts = [target_noisy_hs, target_clean_hs]
+                    rgb_losses["teacher_alignment"] = alignment
+                else:
+                    icl_hs, rgb_losses = self._fuse_rgb_transition(
+                        icl_hs, input_dict, compute_aux=True
+                    )
             icl_length = icl_hs.shape[1]
             latent_parts.append(icl_hs)
             latent_timestep_parts.append(icl_timestep_proj)
@@ -1365,9 +1471,19 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
                     raise ValueError(
                         "RGB-transition ICL caching requires a human-only, seq_id=0 stream"
                     )
-                hidden_states, _ = self._fuse_rgb_transition(
-                    hidden_states, input_dict, compute_aux=False
-                )
+                if self.uses_rgb_readout:
+                    if not update_cache:
+                        raise ValueError("Human readout memory must be installed with update_cache")
+                    memory, _ = self._encode_rgb_transition(
+                        hidden_states, input_dict, compute_aux=False)
+                    self.rgb_readout_memory = memory.detach()
+                else:
+                    hidden_states, _ = self._fuse_rgb_transition(
+                        hidden_states, input_dict, compute_aux=False
+                    )
+            elif self.uses_rgb_readout:
+                hidden_states = self._inference_rgb_readout(
+                    hidden_states, input_dict, grid_id, query_seq)
         for name, value in (
             ("current_seq_ids", query_seq),
             ("current_frame_ids", query_frame),

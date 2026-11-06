@@ -149,6 +149,48 @@ def read_saved_gate(transformer_path):
     return gate
 
 
+def ensure_probe_observation(server, observations):
+    """Use the real initial observation before a readout-only offline probe.
+
+    Normal deployment installs this in ``_infer_icl``. The smoke test also runs
+    probes *before* that call, so it must explicitly supply the same observation;
+    an unobserved generated video or cached robot future would be invalid here.
+    """
+    if not getattr(server.transformer, "uses_rgb_readout", False):
+        return None
+    if server.readout_observation_latent is None:
+        latent = server._encode_initial_obs({"obs": observations[:1]})
+        server.readout_observation_latent = latent[:, :, -1:].detach().clone()
+    return server.readout_observation_latent
+
+
+def validate_readout_probe(mode, first, changed, global_tokens):
+    """A controlled intervention tests the readout mechanism, not task quality."""
+    import torch
+
+    if first.shape != changed.shape or first.ndim != 3:
+        raise AssertionError("Readout probe output shapes differ")
+    if not torch.isfinite(first).all() or not torch.isfinite(changed).all():
+        raise AssertionError("Nonfinite readout probe output")
+    delta = first.float() - changed.float()
+    result = {"shape": list(first.shape), "max_abs": float(delta.abs().max())}
+    if mode == "static":
+        torch.testing.assert_close(first, changed, atol=0, rtol=0)
+        result["state_invariant"] = True
+    elif mode == "global_local":
+        torch.testing.assert_close(first[:, :global_tokens], changed[:, :global_tokens], atol=0, rtol=0)
+        if torch.equal(first[:, global_tokens:], changed[:, global_tokens:]):
+            raise AssertionError("Local readout ignored a state intervention")
+        result.update(global_invariant=True, local_state_sensitive=True)
+    elif mode == "state":
+        if torch.equal(first, changed):
+            raise AssertionError("State readout ignored a state intervention")
+        result["state_sensitive"] = True
+    else:
+        raise ValueError(f"Unsupported readout probe mode: {mode}")
+    return result
+
+
 def run_gpu(args, first, second, prompt, observations, report):
     import numpy as np
     import torch
@@ -186,7 +228,7 @@ def run_gpu(args, first, second, prompt, observations, report):
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     init_logger()
     init_distributed(1, local_rank, 0)
-    hook = None
+    hooks = []
     try:
         torch.manual_seed(args.seed)
         cfg = deepcopy(VA_CONFIGS["robotwin"])
@@ -216,13 +258,29 @@ def run_gpu(args, first, second, prompt, observations, report):
         report["checkpoint_transformer_path"] = str((model_root / "transformer").resolve())
         report["checkpoint_feature_spec"] = feature_spec
         calls = []
+        readout_calls = []
+        captured_readouts = []
+        capture_readout = False
+        uses_readout = bool(server.transformer.uses_rgb_readout)
 
         def rgb_call(_module, inputs, kwargs):
             if kwargs.get("compute_aux", False) or kwargs.get("robot_features") is not None:
                 raise AssertionError("Inference must not use robot future features or auxiliary targets")
             calls.append({"human_feature_shape": list(inputs[0].shape)})
 
-        hook = server.transformer.rgb_transition.register_forward_pre_hook(rgb_call, with_kwargs=True)
+        hooks.append(server.transformer.rgb_transition.register_forward_pre_hook(rgb_call, with_kwargs=True))
+        if uses_readout:
+            def readout_call(_module, inputs, output):
+                readout_calls.append({"memory_shape": list(inputs[0].shape),
+                                      "state_shape": list(inputs[1].shape),
+                                      "output_shape": list(output.shape)})
+                if capture_readout:
+                    captured_readouts.append(output.detach().float().cpu().clone())
+            hooks.append(server.transformer.rgb_transition.readout.register_forward_hook(readout_call))
+            report["readout"] = {"mode": server.transformer.rgb_transition.readout_mode,
+                                 "num_tokens": server.transformer.rgb_transition.readout.num_tokens,
+                                 "global_tokens": server.transformer.rgb_transition.readout.global_tokens,
+                                 "human_wan_context_retained": True}
 
         def counts():
             return {str(key): int(value) for key, value in server.transformer.cache_counts().items()}
@@ -233,6 +291,14 @@ def run_gpu(args, first, second, prompt, observations, report):
                           video_guidance_scale=-1, icl_guidance_scale=args.icl_guidance_scale)
             if server.chunk_idx != 0 or server.last_predicted_actions is not None:
                 raise AssertionError("Reset retained robot history")
+            if uses_readout:
+                if server.readout_observation_latent is not None:
+                    raise AssertionError("Reset retained readout observation")
+                memory = server.transformer.rgb_readout_memory
+                if use_icl and server.transformer.enable_rgb_transition:
+                    assert memory is not None, "Reset did not install human readout memory"
+                else:
+                    assert memory is None, "Reset retained human readout memory"
             if use_icl:
                 assert server.transformer.cache_counts().get(ICL_CACHE_TYPE, 0) > 0
                 assert server.transformer.cache_counts().get(OBSERVATION_CACHE_TYPE, 0) == 0
@@ -260,6 +326,7 @@ def run_gpu(args, first, second, prompt, observations, report):
                                 generator=generator, device=server.device, dtype=server.dtype)
 
             def predict_probe(force_cfg=None):
+                ensure_probe_observation(server, observations)
                 previous = server.use_icl_cfg
                 if force_cfg is not None:
                     server.use_icl_cfg = force_cfg
@@ -281,12 +348,42 @@ def run_gpu(args, first, second, prompt, observations, report):
                         "reference_rms": float(first.square().mean().sqrt()),
                         "allclose_1e2": torch.allclose(first, other, atol=1e-2, rtol=1e-2)}
 
+            capture_readout = uses_readout
             conditional_a, negative_a = predict_probe().chunk(2, dim=1)
+            if uses_readout:
+                assert len(captured_readouts) == 1
+                original_state = server.readout_observation_latent
+                # Keep the main policy query, human memory and KV cache fixed.
+                # This synthetic control changes only the new readout input.
+                perturbation = torch.linspace(-0.25, 0.25, original_state.numel(),
+                                              device=original_state.device).reshape_as(original_state)
+                server.readout_observation_latent = original_state + perturbation.to(original_state)
+                try:
+                    conditional_changed, negative_changed = predict_probe().chunk(2, dim=1)
+                finally:
+                    server.readout_observation_latent = original_state
+                assert len(captured_readouts) == 2
+                readout = server.transformer.rgb_transition.readout
+                report["readout"]["state_intervention"] = {
+                    **validate_readout_probe(readout.mode, *captured_readouts, readout.global_tokens),
+                    "input": "synthetic perturbation only to readout state; main query and caches fixed",
+                    "conditional_output_change": difference(conditional_a, conditional_changed),
+                    "negative_output_change": difference(negative_a, negative_changed),
+                }
+                torch.testing.assert_close(negative_a, negative_changed, atol=1e-2, rtol=1e-2)
+            capture_readout = False
             started = time.monotonic()
+            readouts_before_inference = len(readout_calls)
             actions = server._infer_icl({"obs": observations[:1]})
             torch.cuda.synchronize()
             report["first_chunk"] = {**check_actions(actions), "seconds": time.monotonic() - started,
                                       "cache": counts()}
+            if uses_readout:
+                assert len(readout_calls) > readouts_before_inference, "Policy skipped demo readout"
+                report["first_chunk"]["readout_calls"] = len(readout_calls) - readouts_before_inference
+                observed_before_update = server.readout_observation_latent.detach().clone()
+                memory_before_update = server.transformer.rgb_readout_memory
+                readouts_before_update = len(readout_calls)
             server._compute_icl_kv_cache({"obs": observations[1:]})
             observed_counts = server.transformer.cache_counts()
             assert observed_counts.get(ICL_CACHE_TYPE, 0) > 0
@@ -294,6 +391,14 @@ def run_gpu(args, first, second, prompt, observations, report):
             assert observed_counts.get(PREDICTION_CACHE_TYPE, 0) == 0
             assert server.chunk_idx == 1 and len(calls) == 1
             report["real_observation_cache_update"] = {"cache": counts(), "chunk_idx": server.chunk_idx}
+            if uses_readout:
+                assert len(readout_calls) > readouts_before_update
+                assert server.transformer.rgb_readout_memory is memory_before_update
+                report["real_observation_cache_update"].update(
+                    readout_calls=len(readout_calls) - readouts_before_update,
+                    human_memory_preserved=True,
+                    observed_state_change=difference(observed_before_update.float().cpu(),
+                                                     server.readout_observation_latent.float().cpu()))
             if args.second_chunk:
                 started = time.monotonic()
                 actions = server._infer_icl({"obs": observations[1:]})
@@ -346,9 +451,11 @@ def run_gpu(args, first, second, prompt, observations, report):
             torch.testing.assert_close(baseline_negative, negative_a, atol=1e-2, rtol=1e-2)
             torch.testing.assert_close(baseline_delta, rgb_delta, atol=1e-2, rtol=1e-2)
             assert len(calls) == 2
+            if uses_readout:
+                report["readout"]["forward_calls"] = readout_calls
         report["peak_gpu_allocated_gb"] = torch.cuda.max_memory_allocated() / 1e9
     finally:
-        if hook is not None:
+        for hook in hooks:
             hook.remove()
         if dist.is_initialized():
             dist.destroy_process_group()

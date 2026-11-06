@@ -14,6 +14,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .rgb_readout import DemoReadout
 from .third_party.wala import ContinuousTransitionBottleneckTokenizer
 
 
@@ -111,6 +112,25 @@ class RGBTransitionConditioner(nn.Module):
         # FSDP2 cannot shard scalar parameters; a one-element vector broadcasts
         # identically and still supports item() for training metrics.
         self.gate = nn.Parameter(torch.zeros(1))
+        # Add after all legacy parameters so old seeded initialization stays
+        # unchanged. The original human-fusion mode owns no readout parameters.
+        self.readout_mode = config.get("readout_mode", "human")
+        if self.readout_mode not in {"human", *DemoReadout.MODES}:
+            raise ValueError(f"Unsupported readout_mode: {self.readout_mode!r}")
+        self.readout = None
+        if self.readout_mode != "human":
+            count = self._positive_int(config, "readout_num_tokens", 32)
+            global_count = config.get("readout_global_tokens", min(8, count // 2))
+            self.readout = DemoReadout(
+                hidden_dim=self.hidden_dim,
+                state_dim=self.video_dim,
+                num_heads=self.num_heads,
+                num_tokens=count,
+                global_tokens=global_count,
+                mode=self.readout_mode,
+                num_layers=self._positive_int(config, "readout_layers", 1),
+                norm_eps=self.norm_eps,
+            )
 
     @staticmethod
     def _positive_int(config, key, default):
@@ -261,3 +281,13 @@ class RGBTransitionConditioner(nn.Module):
         attended = attended.transpose(1, 2).reshape(batch, count, self.hidden_dim)
         residual = self.output_proj(attended).to(dtype=human_hidden.dtype)
         return human_hidden + self.gate.tanh().to(dtype=human_hidden.dtype) * residual
+
+    def read_tokens(self, human_tokens, state_features, state_positions=None):
+        """Read human memory using only the caller's causal robot observation.
+
+        This is invoked inside the owning model's FSDP forward, like ``fuse``.
+        Robot future features used by ``forward`` never enter this interface.
+        """
+        if self.readout is None:
+            raise RuntimeError("read_tokens requires a robot-side readout mode")
+        return self.readout(human_tokens, state_features, state_positions)

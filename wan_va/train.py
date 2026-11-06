@@ -24,6 +24,7 @@ from .checkpoint_io import (
     save_sharded_safetensors as _save_sharded_safetensors,
 )
 import json
+import math
 
 from .configs import TRAIN_DATASET_CONFIGS, VA_CONFIGS
 from .configs.va_robotwin_cfg import load_robotwin_norm_stat
@@ -69,7 +70,75 @@ RGB_LOSS_COMPONENTS = tuple(
     name + suffix
     for name in ('human_self', 'robot_self', 'transfer')
     for suffix in ('', '_l1', '_cosine')
-)
+) + ('teacher_alignment',)
+
+
+def validated_future_teacher(config, feature_spec, device='cpu'):
+    """Fail before backbone allocation if a teacher experiment is incomplete."""
+    weight = float(getattr(config, 'future_teacher_loss_weight', 0.0))
+    path = getattr(config, 'future_teacher_checkpoint', None)
+    if not math.isfinite(weight) or weight < 0:
+        raise ValueError('future_teacher_loss_weight must be finite and nonnegative')
+    if weight == 0:
+        if path:
+            raise ValueError('A future teacher checkpoint requires a positive loss weight')
+        return None, None
+    if not path:
+        raise ValueError('Set ZERO_WAM_FUTURE_TEACHER to a trained teacher artifact')
+    rgb = dict(getattr(config, 'rgb_transition_config', {}))
+    if not getattr(config, 'enable_rgb_transition', False) or rgb.get('readout_mode') != 'state':
+        raise ValueError('The future teacher experiment requires state-conditioned RGB readout')
+    from .modules.future_teacher import load_future_teacher
+    teacher, metadata = load_future_teacher(
+        path, device=device, dtype=torch.float32,
+        allow_smoke=bool(getattr(config, 'smoke_test', False)),
+        expected_feature_spec=feature_spec,
+    )
+    selected_tasks = getattr(config, 'included_task_names', None)
+    if selected_tasks is not None:
+        training = metadata.get('training', {})
+        trained_tasks = training.get('included_tasks') if isinstance(training, dict) else None
+        if (not isinstance(trained_tasks, list) or not trained_tasks
+                or any(not isinstance(task, str) or not task for task in trained_tasks)
+                or len(set(trained_tasks)) != len(trained_tasks)
+                or set(trained_tasks) != set(selected_tasks)
+                or training.get('heldout_tasks_used') is not False):
+            raise ValueError('Future teacher training task split differs from policy subset')
+        trained_steps = training.get('num_steps')
+        if (type(trained_steps) is not int or trained_steps < 1
+                or trained_steps != metadata['successful_steps']):
+            raise ValueError('Future teacher training step provenance is inconsistent')
+    if (teacher.num_tokens != int(rgb.get('readout_num_tokens', 32))
+            or teacher.hidden_dim != int(rgb.get('hidden_dim', 256))
+            or teacher.feature_dim != int(rgb.get('feature_dim', 768))
+            or teacher.max_patches < int(rgb.get('max_patches', 256))
+            or teacher.action_dim != int(config.action_dim)
+            or teacher.max_action_steps < int(config.max_frame_chunk_size) * int(config.action_per_frame)
+            or teacher.max_future_steps < int(config.max_frame_chunk_size)):
+        raise ValueError('Future teacher dimensions/horizon do not match policy readout')
+    return teacher, metadata
+
+
+@torch.no_grad()
+def future_teacher_chunk_targets(teacher, features, chunk_size, actions_mask):
+    """Detached future-only targets; anchor zero is the already observed image."""
+    if features.ndim != 4 or features.shape[0] != 1 or chunk_size < 1:
+        raise ValueError('Expected one [1,F,P,D] RGB sequence and a positive chunk size')
+    frames = features.shape[1]
+    if actions_mask.ndim != 5 or actions_mask.shape[0] != 1 or actions_mask.shape[2] != frames:
+        raise ValueError('Teacher action validity must use the same latent anchors')
+    targets, valid = [], []
+    for start in range(0, frames, chunk_size):
+        end = min(start + chunk_size, frames)
+        future_start = max(start, 1)
+        # Entirely padded/invalid chunks cannot supply an action-shaped target.
+        present = end > future_start and bool(actions_mask[:, :, future_start:end].any())
+        valid.append(present)
+        if present:
+            targets.append(teacher.encode_future(features[:, future_start:end]).detach())
+        else:
+            targets.append(features.new_zeros((1, teacher.num_tokens, teacher.hidden_dim), dtype=torch.float32))
+    return torch.cat(targets, 0), torch.tensor(valid, device=features.device, dtype=torch.bool)
 
 
 _DATASET_PATH_OVERRIDES = (
@@ -200,6 +269,20 @@ class Trainer:
                 mcp_hidden_collect_layers=config.mcp_hidden_collect_layers,
                 mcp_loss_weights=config.mcp_loss_weights,
             )
+
+        feature_spec = {key: config.rgb_transition_config[key]
+                        for key in ('rgb_encoder_id', 'rgb_encoder_revision', 'rgb_preprocessing')
+                        if key in getattr(config, 'rgb_transition_config', {})}
+        self.future_teacher, teacher_metadata = validated_future_teacher(config, feature_spec, self.device)
+        self.training_provenance = {
+            'smoke_test': bool(getattr(config, 'smoke_test', False)),
+            'future_teacher': teacher_metadata,
+            'future_teacher_loss_weight': float(getattr(config, 'future_teacher_loss_weight', 0)),
+        }
+        if teacher_metadata is not None and config.rank == 0:
+            logger.info('Frozen future teacher: sha256=%s steps=%s smoke_only=%s',
+                        teacher_metadata['weights_sha256'], teacher_metadata['successful_steps'],
+                        teacher_metadata['smoke_test'])
 
         # Load models
         logger.info("Loading models...")
@@ -588,6 +671,17 @@ class Trainer:
                 'human_features': batch_dict['rgb_human_features'],
                 'robot_features': batch_dict['rgb_robot_features'],
             }
+            if getattr(self.config, 'rgb_transition_config', {}).get('readout_mode', 'human') != 'human':
+                # Readout sees real observations, independently of the backbone's
+                # existing noisy-history augmentation. Selection is causal in model.forward.
+                input_dict['readout_observation_latents'] = batch_dict['latents'].detach()
+            if getattr(self, 'future_teacher', None) is not None:
+                targets, valid = future_teacher_chunk_targets(
+                    self.future_teacher, batch_dict['rgb_robot_features'], chunk_size,
+                    batch_dict['actions_mask'],
+                )
+                input_dict['readout_teacher_targets'] = targets
+                input_dict['readout_teacher_valid'] = valid
         if self.enable_mcp:
             mcp_latent_dicts = []
             for module_index in range(self.config.num_mcp_modules):
@@ -753,7 +847,14 @@ class Trainer:
             )
             if not torch.isfinite(rgb_loss.detach()).all():
                 raise FloatingPointError('Non-finite RGB auxiliary loss')
-        loss = latent_loss + action_loss + mcp_loss + rgb_loss
+        teacher_loss = (
+            rgb_outputs.get('teacher_alignment', latent_loss.new_zeros(())).float()
+            * float(getattr(self.config, 'future_teacher_loss_weight', 0))
+            / self.gradient_accumulation_steps
+        )
+        if not torch.isfinite(teacher_loss.detach()).all():
+            raise FloatingPointError('Non-finite future teacher alignment loss')
+        loss = latent_loss + action_loss + mcp_loss + rgb_loss + teacher_loss
 
         loss.backward()
         if first_batch:
@@ -765,6 +866,7 @@ class Trainer:
             'mcp_losses': [depth_loss.detach() for depth_loss in mcp_losses],
             'mcp_loss': mcp_loss.detach(),
             'rgb_loss': rgb_loss.detach(),
+            'future_teacher_loss': teacher_loss.detach(),
             'rgb_components': {
                 key: rgb_outputs.get(key, rgb_loss.new_zeros(())).detach().float()
                 / self.gradient_accumulation_steps
@@ -954,6 +1056,8 @@ class Trainer:
                         if self.enable_rgb_transition:
                             record.update(rgb_loss=rgb_loss_show, rgb_gate=losses['rgb_gate'])
                             record.update({f'rgb_{key}': value for key, value in rgb_component_shows.items()})
+                            record['future_teacher_loss'] = rgb_component_shows.get('teacher_alignment', 0) * float(
+                                getattr(self.config, 'future_teacher_loss_weight', 0))
                         with open(metrics_path, 'a', encoding='utf-8') as metrics_file:
                             metrics_file.write(json.dumps(record) + '\n')
                     progress_bar.n += 1
@@ -999,6 +1103,8 @@ class Trainer:
                             log_values['rgb/weighted_total'] = rgb_loss_show
                             log_values['rgb/gate'] = losses['rgb_gate']
                             log_values.update({f'rgb/{key}': value for key, value in rgb_component_shows.items()})
+                            log_values['rgb/future_teacher_weighted'] = rgb_component_shows.get('teacher_alignment', 0) * float(
+                                getattr(self.config, 'future_teacher_loss_weight', 0))
                         self.wandb.log(log_values, step=self.step + 1)
                 
                 self.step += 1
@@ -1118,6 +1224,10 @@ def training_config_report(config):
         if getattr(config, 'enable_rgb_transition', False):
             from .dataset.rgb_feature_cache import validate_rgb_feature_cache
             sources[-1]['rgb_features'] = validate_rgb_feature_cache(dataset_config)
+    feature_specs = [source['rgb_features']['feature_spec'] for source in sources if 'rgb_features' in source]
+    if feature_specs and any(spec != feature_specs[0] for spec in feature_specs[1:]):
+        raise ValueError('RGB sources must share encoder/preprocessing')
+    _, teacher_metadata = validated_future_teacher(config, feature_specs[0] if feature_specs else {})
     return {
         'world_size': config.world_size,
         'batch_size': config.batch_size,
@@ -1137,6 +1247,9 @@ def training_config_report(config):
         'rgb_feature_root': getattr(config, 'rgb_feature_root', None),
         'rgb_transition_config': getattr(config, 'rgb_transition_config', None),
         'rgb_loss_weight': getattr(config, 'rgb_loss_weight', None),
+        'future_teacher_checkpoint': getattr(config, 'future_teacher_checkpoint', None),
+        'future_teacher_loss_weight': getattr(config, 'future_teacher_loss_weight', 0),
+        'future_teacher_metadata': teacher_metadata,
         'smoke_test': bool(getattr(config, 'smoke_test', False)),
         'rgb_smoke_sample_ids': getattr(config, 'rgb_smoke_sample_ids', None),
     }
@@ -1169,6 +1282,11 @@ def run(args):
                         validate_rgb_feature_cache(source['config'])
                         for source in config.dataset_sources
                     ]}
+                    # Also reject missing, smoke-only, mismatched or corrupt
+                    # teachers before any rank allocates the large policy.
+                    _, teacher_metadata = validated_future_teacher(
+                        config, preflight[0]['reports'][0]['feature_spec'])
+                    preflight[0]['future_teacher'] = teacher_metadata
                 except Exception as error:
                     preflight[0] = {'error': f'{type(error).__name__}: {error}'}
             if dist.is_initialized():

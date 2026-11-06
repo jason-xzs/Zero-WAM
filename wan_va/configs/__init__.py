@@ -8,6 +8,7 @@ from .va_robotwin_full_train_cfg import va_robotwin_full_train_cfg
 from .va_robotwin_subset12_train_cfg import va_robotwin_subset12_train_cfg
 from .va_robotwin_subset12_rgb_train_cfg import va_robotwin_subset12_rgb_train_cfg
 from .va_robotwin_subset12_rgb_b300_cfg import va_robotwin_subset12_rgb_b300_cfg
+from .va_robotwin_subset12_rgb_readout_cfg import READOUT_CONFIGS
 from .va_agibot_train_cfg import va_agibot_train_cfg
 from .va_robocoin_train_cfg import va_robocoin_train_cfg
 from .va_robomind_train_cfg import va_robomind_train_cfg
@@ -34,6 +35,7 @@ VA_CONFIGS = {
     'oxe_train': va_oxe_train_cfg,
     'demo': va_demo_cfg,
     'demo_i2va': va_demo_i2va_cfg,
+    **READOUT_CONFIGS,
 }
 
 TRAIN_DATASET_CONFIGS = {
