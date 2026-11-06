@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-export RGB_READOUT_VARIANT=${RGB_READOUT_VARIANT:-static}
+export RGB_READOUT_VARIANT=${RGB_READOUT_VARIANT:-teacher}
 case "$RGB_READOUT_VARIANT" in
     static|state|global_local|teacher) ;;
     *) printf 'Invalid RGB_READOUT_VARIANT: %s\n' "$RGB_READOUT_VARIANT" >&2; exit 2 ;;
