@@ -224,6 +224,10 @@ B300 配方的 CPU 全数据预检通过：12 个训练任务、600 对 human/ro
 
 独立教师短测为 2 个优化步、累积 8，覆盖全部 12 个样本；动作 flow loss 为 1.644527、1.360290，未来 encoder 梯度非零且有限，保存后重载目标逐值一致。该 artifact 明确标为 **smoke-only**，正式策略预检会拒绝它；正式实验须先完成独立教师训练和有用性验证。
 
+四份策略 checkpoint 的真实服务推理均通过：单卡 A800，视频／动作各 50 步，ICL CFG=5，两段动作输出均为 `[16, 2, 16]` 且有限。严格加载报告的 missing/unexpected/mismatched/error 列表均为空；切换示范、无示范、真实观测缓存更新及 CFG 隔离检查通过。每次完整测试记录 106 次 readout 调用，部署未读取 robot future 或冻结教师。
+
+仅改变 readout 状态的干预结果：static 输出严格不变；state/teacher 输出 token 改变；global_local 的前 4 个 token 严格不变、后 12 个改变，四者的 CFG 负分支变化均为零。**state 的 6-step checkpoint 虽然 readout token 已响应状态，BF16 策略 probe 输出仍未改变**（门控仅约 `3.85e-7`）；这不能作为已学会状态控制的证据。教师和压缩版本该 probe 的正分支发生变化，也不代表成功率改善。原始诊断保存在各 `*-inference.json`，供后续在有效训练步数后重复比较。
+
 | 默认方案 | RGB 模块唯一参数量 | 其中新增 readout 参数量 |
 | --- | ---: | ---: |
 | static / state / teacher 学生，32 tokens | 9,643,265 | 2,377,472 |
