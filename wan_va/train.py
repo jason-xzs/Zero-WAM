@@ -70,7 +70,8 @@ RGB_LOSS_COMPONENTS = tuple(
     name + suffix
     for name in ('human_self', 'robot_self', 'transfer')
     for suffix in ('', '_l1', '_cosine')
-) + ('teacher_alignment',)
+) + ('teacher_alignment', 'role_human', 'role_robot', 'object_future',
+     'relation_future', 'donor_effect')
 
 
 def validated_future_teacher(config, feature_spec, device='cpu'):
@@ -192,7 +193,9 @@ def _build_dataset_sources(config, args, rank, local_rank, world_size):
                 dataset_config[key] = config[key]
         for key in ('enable_rgb_transition', 'rgb_feature_root',
                     'rgb_transition_config', 'rgb_smoke_sample_ids',
-                    'rgb_encoder_id', 'rgb_encoder_revision', 'rgb_preprocessing'):
+                    'rgb_encoder_id', 'rgb_encoder_revision', 'rgb_preprocessing',
+                    'role_manifest_path', 'role_require_complete',
+                    'frame_chunk_size', 'max_frame_chunk_size'):
             if hasattr(config, key):
                 dataset_config[key] = deepcopy(config[key])
 
@@ -278,6 +281,7 @@ class Trainer:
             'smoke_test': bool(getattr(config, 'smoke_test', False)),
             'future_teacher': teacher_metadata,
             'future_teacher_loss_weight': float(getattr(config, 'future_teacher_loss_weight', 0)),
+            'role_features': getattr(config, 'role_preflight', None),
         }
         if teacher_metadata is not None and config.rank == 0:
             logger.info('Frozen future teacher: sha256=%s steps=%s smoke_only=%s',
@@ -671,6 +675,9 @@ class Trainer:
                 'human_features': batch_dict['rgb_human_features'],
                 'robot_features': batch_dict['rgb_robot_features'],
             }
+            if getattr(self.config, 'rgb_transition_config', {}).get('role_effect_enabled', False):
+                for key in ('role_targets', 'donor_human_features', 'donor_valid'):
+                    input_dict['rgb_transition'][key] = batch_dict[key]
             if getattr(self.config, 'rgb_transition_config', {}).get('readout_mode', 'human') != 'human':
                 # Readout sees real observations, independently of the backbone's
                 # existing noisy-history augmentation. Selection is causal in model.forward.
@@ -1224,6 +1231,9 @@ def training_config_report(config):
         if getattr(config, 'enable_rgb_transition', False):
             from .dataset.rgb_feature_cache import validate_rgb_feature_cache
             sources[-1]['rgb_features'] = validate_rgb_feature_cache(dataset_config)
+            if config.rgb_transition_config.get('role_effect_enabled', False):
+                from .dataset.role_feature_cache import validate_role_feature_cache
+                sources[-1]['role_features'] = validate_role_feature_cache(dataset_config)
     feature_specs = [source['rgb_features']['feature_spec'] for source in sources if 'rgb_features' in source]
     if feature_specs and any(spec != feature_specs[0] for spec in feature_specs[1:]):
         raise ValueError('RGB sources must share encoder/preprocessing')
@@ -1287,6 +1297,12 @@ def run(args):
                     _, teacher_metadata = validated_future_teacher(
                         config, preflight[0]['reports'][0]['feature_spec'])
                     preflight[0]['future_teacher'] = teacher_metadata
+                    if config.rgb_transition_config.get('role_effect_enabled', False):
+                        from .dataset.role_feature_cache import validate_role_feature_cache
+                        preflight[0]['role_features'] = [
+                            validate_role_feature_cache(source['config'])
+                            for source in config.dataset_sources
+                        ]
                 except Exception as error:
                     preflight[0] = {'error': f'{type(error).__name__}: {error}'}
             if dist.is_initialized():
@@ -1294,6 +1310,7 @@ def run(args):
             if 'error' in preflight[0]:
                 raise RuntimeError(f"RGB feature preflight failed: {preflight[0]['error']}")
             feature_specs = [report['feature_spec'] for report in preflight[0]['reports']]
+            config.role_preflight = preflight[0].get('role_features')
             if any(spec != feature_specs[0] for spec in feature_specs[1:]):
                 raise ValueError('RGB dataset sources must share the same frozen encoder and preprocessing')
             # Save the actual validated teacher/preprocessing in the model
@@ -1304,6 +1321,8 @@ def run(args):
                 source['config'].rgb_transition_config = deepcopy(config.rgb_transition_config)
             if rank == 0:
                 logger.info('RGB feature preflight: %s', preflight[0]['reports'])
+                if 'role_features' in preflight[0]:
+                    logger.info('Role feature preflight: %s', preflight[0]['role_features'])
         trainer = Trainer(config)
         trainer.train()
     except BaseException:

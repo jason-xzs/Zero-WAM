@@ -195,6 +195,10 @@ class ICLLeRobotLatentDataset(LatentLeRobotDataset):
             config.icl_manifest_path
         )
         self.human_latent_path = Path(config.human_latent_path)
+        self.role_manifest = None
+        if getattr(config, "rgb_transition_config", {}).get("role_effect_enabled", False):
+            from .role_feature_cache import RoleManifest
+            self.role_manifest = RoleManifest(config.role_manifest_path, config.included_task_names)
         super().__init__(repo_id=repo_id, config=config, latent_root=latent_root)
         self.new_metas = [
             meta
@@ -349,6 +353,15 @@ class ICLLeRobotLatentDataset(LatentLeRobotDataset):
                 raise ValueError("RGB preprocessing differs from the saved model config")
             item.update(rgb_human_features=human["features"], rgb_robot_features=robot["features"],
                         rgb_human_frame_indices=human["frame_indices"], rgb_robot_frame_indices=robot["frame_indices"])
+            if getattr(self, 'role_manifest', None) is not None:
+                from .rgb_feature_cache import rgb_pair_key
+                roles, donor, donor_valid = self.role_manifest.load(
+                    rgb_pair_key(sample), human, robot,
+                    human_feature_path(root, human_latent_file),
+                    robot_feature_path(root, self.root.name, self.used_video_keys[0], meta),
+                    require_complete=self.config.role_require_complete,
+                )
+                item.update(role_targets=roles, donor_human_features=donor, donor_valid=donor_valid)
         return item
 
 

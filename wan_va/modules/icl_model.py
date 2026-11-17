@@ -29,7 +29,7 @@ from torch.nn.attention.flex_attention import (
 )
 
 from .model import WanRotaryPosEmbed, WanTimeTextImageEmbedding
-from .rgb_transition import RGBTransitionConditioner
+from .rgb_transition import RGBTransitionConditioner, build_rgb_transition_conditioner
 
 
 ICL_CACHE_TYPE = 2
@@ -642,7 +642,7 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
         self.attn_window = attn_window
         self.enable_rgb_transition = bool(enable_rgb_transition)
         self.rgb_transition = (
-            RGBTransitionConditioner(rgb_transition_config or {}, video_dim=self.inner_dim)
+            build_rgb_transition_conditioner(rgb_transition_config or {}, video_dim=self.inner_dim)
             if self.enable_rgb_transition else None
         )
 
@@ -772,7 +772,7 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
                         "Initialize the new RGB branch on CPU before device_map dispatch"
                     )
                 reference = model.patch_embedding_mlp.weight
-                model.rgb_transition = RGBTransitionConditioner(
+                model.rgb_transition = build_rgb_transition_conditioner(
                     dict(model.config.rgb_transition_config or {}),
                     video_dim=model.inner_dim,
                 ).to(device=reference.device, dtype=reference.dtype)
@@ -795,7 +795,10 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
         )
         if not torch.is_tensor(zero):
             zero = self.patch_embedding_mlp.weight.new_zeros((), dtype=torch.float32)
-        return {"human_self": zero, "robot_self": zero, "transfer": zero, "total": zero}
+        losses = {"human_self": zero, "robot_self": zero, "transfer": zero, "total": zero}
+        if getattr(self.rgb_transition, "role_effect_enabled", False):
+            losses.update({key: zero for key in self.rgb_transition.role_loss_weights})
+        return losses
 
     @property
     def uses_rgb_readout(self):
@@ -818,9 +821,20 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
             robot_features = robot_features.to(
                 device=human_hidden.device, dtype=human_hidden.dtype
             )
-        tokens, losses = self.rgb_transition(
-            human_features, robot_features=robot_features, compute_aux=compute_aux
-        )
+        if getattr(self.rgb_transition, "role_effect_enabled", False):
+            tokens, losses, aux_context = self.rgb_transition(
+                human_features, robot_features=robot_features, compute_aux=compute_aux,
+                role_targets=rgb_inputs.get("role_targets") if compute_aux else None,
+                donor_human_features=rgb_inputs.get("donor_human_features") if compute_aux else None,
+                donor_valid=rgb_inputs.get("donor_valid") if compute_aux else None,
+                return_aux_context=True,
+            )
+            if compute_aux:
+                losses["_role_effect_aux"] = aux_context
+        else:
+            tokens, losses = self.rgb_transition(
+                human_features, robot_features=robot_features, compute_aux=compute_aux
+            )
         if compute_aux:
             # Also connect any unused auxiliary parameters when a batch has no
             # robot teacher, or an ordinary-feature control disables a loss.
@@ -835,7 +849,8 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
         )
         return self.rgb_transition.fuse(human_hidden, tokens), losses
 
-    def _training_rgb_readout(self, noisy, clean, memory, input_dict):
+    def _training_rgb_readout(self, noisy, clean, memory, input_dict, *,
+                              role_aux_context=None, role_losses=None):
         """Read each chunk from its preceding observed frame, never its future.
 
         The first chunk has the recorded initial observation (frame zero), as
@@ -845,6 +860,10 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
         stream = input_dict["latent_dict"]
         grid = stream["grid_id"][0]
         frame_count = stream["latent"].shape[2]
+        if role_aux_context is not None:
+            role_robot = role_aux_context.get("robot_features")
+            if role_robot is not None and role_robot.shape[1] != frame_count:
+                raise ValueError("Role robot features must match the complete Wan frame timeline")
         if self.patch_size[0] != 1:
             raise ValueError("RGB readout requires temporal patch size 1")
         patches = clean.shape[1] // frame_count
@@ -878,12 +897,21 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
             if tuple(teacher_valid.shape) != (expected_chunks,):
                 raise ValueError("Future teacher validity does not match chunks")
         new_noisy, new_clean, alignments = [], [], []
+        role_chunk_losses = []
         for index, start in enumerate(range(0, frame_count, chunk)):
             end = min(start + chunk, frame_count)
             observed = max(start - 1, 0)
             state = observation_states[:, observed]
             positions = grid[1:3, observed * patches:(observed + 1) * patches].T
-            tokens = self.rgb_transition.read_tokens(memory, state, positions)
+            if getattr(self.rgb_transition, "role_effect_enabled", False):
+                tokens, chunk_losses = self.rgb_transition.training_read_tokens(
+                    memory, state, positions, aux_context=role_aux_context,
+                    observed_index=observed,
+                    future_indices=list(range(max(start, observed + 1), end)),
+                )
+                role_chunk_losses.append(chunk_losses)
+            else:
+                tokens = self.rgb_transition.read_tokens(memory, state, positions)
             new_noisy.append(self.rgb_transition.fuse(
                 noisy_frames[:, start:end].flatten(1, 2), tokens))
             new_clean.append(self.rgb_transition.fuse(
@@ -894,6 +922,11 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
                     tokens.float(), target, dim=-1, eps=1e-6)).mean())
         alignment = (torch.stack(alignments).mean() if alignments
                      else memory.float().sum() * 0)
+        if role_losses is not None and role_chunk_losses:
+            for key in role_chunk_losses[0]:
+                value = torch.stack([loss[key] for loss in role_chunk_losses]).mean()
+                role_losses[key] = value
+                role_losses["total"] = role_losses["total"] + self.rgb_transition.role_loss_weights[key] * value
         return torch.cat(new_noisy, 1), torch.cat(new_clean, 1), alignment
 
     def _inference_rgb_readout(self, hidden, input_dict, grid, seq_ids):
@@ -1247,8 +1280,10 @@ class WanICLTransformer3DModel(ModelMixin, ConfigMixin):
                 if self.uses_rgb_readout:
                     memory, rgb_losses = self._encode_rgb_transition(
                         icl_hs, input_dict, compute_aux=True)
+                    role_aux_context = rgb_losses.pop("_role_effect_aux", None)
                     target_noisy_hs, target_clean_hs, alignment = self._training_rgb_readout(
-                        target_noisy_hs, target_clean_hs, memory, input_dict)
+                        target_noisy_hs, target_clean_hs, memory, input_dict,
+                        role_aux_context=role_aux_context, role_losses=rgb_losses)
                     latent_parts = [target_noisy_hs, target_clean_hs]
                     rgb_losses["teacher_alignment"] = alignment
                 else:

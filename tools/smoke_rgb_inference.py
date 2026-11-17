@@ -276,7 +276,17 @@ def run_gpu(args, first, second, prompt, observations, report):
                                       "output_shape": list(output.shape)})
                 if capture_readout:
                     captured_readouts.append(output.detach().float().cpu().clone())
-            hooks.append(server.transformer.rgb_transition.readout.register_forward_hook(readout_call))
+            # Observe the final deployed read_tokens output, including a role
+            # model's recipient binding, rather than its inner base readout.
+            from types import SimpleNamespace
+            conditioner = server.transformer.rgb_transition
+            original_read_tokens = conditioner.read_tokens
+            def traced_read_tokens(memory, state, positions=None):
+                output = original_read_tokens(memory, state, positions)
+                readout_call(conditioner, (memory, state, positions), output)
+                return output
+            conditioner.read_tokens = traced_read_tokens
+            hooks.append(SimpleNamespace(remove=lambda: setattr(conditioner, 'read_tokens', original_read_tokens)))
             report["readout"] = {"mode": server.transformer.rgb_transition.readout_mode,
                                  "num_tokens": server.transformer.rgb_transition.readout.num_tokens,
                                  "global_tokens": server.transformer.rgb_transition.readout.global_tokens,

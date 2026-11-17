@@ -30,3 +30,4 @@ data/
 *.safetensors
 
 .DS_Store
+local/

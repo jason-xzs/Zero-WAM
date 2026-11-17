@@ -291,3 +291,11 @@ class RGBTransitionConditioner(nn.Module):
         if self.readout is None:
             raise RuntimeError("read_tokens requires a robot-side readout mode")
         return self.readout(human_tokens, state_features, state_positions)
+
+
+def build_rgb_transition_conditioner(config, video_dim=3072):
+    """Select the opt-in role/effect implementation without changing old runs."""
+    if (config or {}).get("role_effect_enabled", False):
+        from .role_effect import RoleEffectConditioner
+        return RoleEffectConditioner(config, video_dim=video_dim)
+    return RGBTransitionConditioner(config or {}, video_dim=video_dim)
