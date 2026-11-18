@@ -1,8 +1,14 @@
 # 角色、效果与语言诊断（2026-11-18）
 
-本次不修改 policy、训练目标或评测默认设置。产物总入口：
+本次不修改 policy、训练目标或评测默认设置。用户要求图片/视频交付，2026-11-19 的大字重绘图位于：
 
-`/share/personal/xiangzishang/compare_zero/role_effect_analysis/index.html`
+`/share/personal/xiangzishang/compare_zero/role_effect_analysis/解释图_20261119/`
+
+主框架图同步更新到 `../架构对比_角色效果.svg` / `.png`，省略语言分支，拆为整体、示范特征、机器人侧与训练监督四张图。图1–3（原分析编号）的数据均为两个分支共用的冻结 DINO 特征；原图4为 C1 六步角色头；语言敏感性图为 base checkpoint。它们不是同一次训练的连续阶段。
+
+PCA 只把768维特征投影到三个颜色通道，不是手/机械臂分割或识别置信度。特征变化是同位置patch相对首帧的特征距离，不是光流、物体轨迹或action。跨域检索图的绿圈是指定查询区域，红圈是目标弱标签，白叉是相似度最高位置；不能把圈本身当作模型找到的区域。
+
+六步角色预测的灰度重绘使用相同 `[0,1]` 范围，白色0、黑色1；接近均匀灰表示预测接近0.5。没有增加训练步数，也没有把这张图作为收敛证据。复跑脚本 `tools/render_role_probability_explanation.py` 读取原六步checkpoint，在预测时不输入mask。
 
 ## 实验与结论
 
