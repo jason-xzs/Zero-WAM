@@ -59,6 +59,8 @@ metadata: schema, pair_key, 原 RGB 文件 SHA256, teacher revision, provenance
 
 ## 准备数据
 
+**另一台服务器的全量准备步骤见 [README.role-annotations.md](README.role-annotations.md)**，包括逐对继续处理、PNG 审核记录、标签合并和 CPU 完整预检。`tools/manage_role_annotations.py` 是批处理入口；下面是单次 SAM2 候选生成的底层接口。
+
 `tools/prepare_role_records.py` 从正式12任务 manifest导出记录、原始帧和空 seed 模板。填写明确对象/part提示后，用官方 SAM2 环境运行：
 
 ```bash

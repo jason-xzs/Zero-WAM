@@ -1,0 +1,101 @@
+{
+  "date": "2026-11-20",
+  "timezone": "Asia/Shanghai",
+  "branch": "RGB-Role-Effect-ICL",
+  "base_commit": "7c1c1ff7220fa69699b14f59e228ca2d258a9c9f",
+  "workflow_script_sha256": "9dba24572c3f81113454ec0caea9c79d3ecc7bc131f067475d793c14967e660d",
+  "scope": "Annotation preparation and cross-server handoff only; policy architecture and training code unchanged.",
+  "full_training_labels_ready": false,
+  "inventory": {
+    "pairs": 600,
+    "tasks": {
+      "beat_block_hammer": 50,
+      "move_pillbottle_pad": 50,
+      "open_laptop": 50,
+      "pick_dual_bottles": 50,
+      "place_bread_skillet": 50,
+      "place_can_basket": 50,
+      "place_container_plate": 50,
+      "place_mouse_pad": 50,
+      "put_object_cabinet": 50,
+      "stack_blocks_two": 50,
+      "stack_bowls_three": 50,
+      "stack_bowls_two": 50
+    },
+    "unique_human_sources": 239,
+    "directory": "local/role_annotation_pipeline_20261120/all600",
+    "init_creates_empty_seeds_not_labels": true
+  },
+  "tests": {
+    "unique_passed": 59,
+    "new_workflow_tests": 16,
+    "first_run": {
+      "command": "python -m pytest -q tests/test_role_annotation_workflow.py tests/test_role_mask_preparation.py tests/test_role_feature_cache.py",
+      "passed": 58,
+      "seconds": 40.01
+    },
+    "follow_up": "After conservative publication-order fix, both finalization success and report-write-failure tests passed (2 tests, 38.83 seconds); the latter adds one new unique test."
+  },
+  "real_pipeline": {
+    "pair_key": "4:64476c9e70b954f0",
+    "task": "place_mouse_pad",
+    "same_pair_as_existing_smoke_data": true,
+    "new_unique_annotated_pairs": 0,
+    "sam2_elapsed_seconds": 33.00886368192732,
+    "teacher": {
+      "source_commit": "2b90b9f5ceec907a1c18123530e92e794ad901a4",
+      "torch_version": "2.6.0+cu124",
+      "checkpoint_sha256": "7402e0d864fa82708a20fbd15bc84245c2f26dff0eb43a4b5b93452deb34be69",
+      "sam2_config": "configs/sam2.1/sam2.1_hiera_t.yaml",
+      "sam_python": "/share/personal/xiangzishang/envs/vace22-inference/bin/python",
+      "preparation_script_sha256": "043e19407cf0f04004bf3b7d453584cba860a720c586e9f3b8ac927c3b39867a",
+      "device": "cuda:0"
+    },
+    "visual_review": "Codex inspected 32 human + 10 robot sampled frames via all three overlay contact sheets; additionally full-size human frames 0/112 and robot frame 128.",
+    "human_source_exclusion_inclusive": [
+      12,
+      108
+    ],
+    "robot_source_exclusion_inclusive": [
+      48,
+      112
+    ],
+    "reviewed_manifest": "local/role_annotation_pipeline_20261120/final-real-pair/reviewed_manifest.json",
+    "reviewed_manifest_sha256": "adb851a7574b5bfb30efdc8eeb7e0fe47a2fd0ac12d9c33d3d1f426a62f7d042",
+    "annotation_sha256": "b5022d56c74f14a220bb12f5dbc69eb3555705659c7d19d69c0b03ce51bc8b24",
+    "selection_validation": {
+      "pairs": 1,
+      "donor_pairs": 0,
+      "per_task": {
+        "place_mouse_pad": {
+          "pairs": 1,
+          "donor_pairs": 0,
+          "human_valid_roles": 38,
+          "human_total_roles": 64,
+          "robot_valid_roles": 15,
+          "robot_total_roles": 20
+        }
+      },
+      "complete_selected_labels": true,
+      "formal_training_preflight_passed": false,
+      "next": "Run check against the actual complete training manifest; selected labels are not full-training approval."
+    },
+    "repeat_run_result": {
+      "unchanged_completed": 1,
+      "new_sam2_attempts": 0
+    }
+  },
+  "full_preflight_negative_test": {
+    "exit_code": 1,
+    "error": "ValueError: Missing reviewed role annotations: 1/600 selected pairs annotated; 599 missing. Prepare complete labels before full training. First missing pair: 104:20b49625b4b1b6c3",
+    "success_report_written": false,
+    "log": "local/role_annotation_pipeline_20261120/expected_full_preflight_rejection.log"
+  },
+  "limitations": [
+    "No complete 600-pair reviewed manifest exists yet.",
+    "Semantic role assignment and visual mask review remain necessary.",
+    "Current seeds must refer to frame 0; unseen entities need an explicit preparation change, not fabricated boxes.",
+    "The real single-pair check has no donor; donor contracts are covered by synthetic workflow and existing loader tests, and existing two-pair audit runs.",
+    "Passing file/timeline/coverage checks does not establish mask ground truth or policy success rates."
+  ]
+}
