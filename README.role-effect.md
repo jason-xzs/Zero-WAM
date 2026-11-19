@@ -2,6 +2,8 @@
 
 本分支 `RGB-Role-Effect-ICL` 将 human demo 的对象绑定与变化表示分开，并在机器人当前观测中重新绑定对象。它是待检验的方法实现，不是已经成立的泛化结论。3DGS / NeRF 与 C2 有序算子组合均未在本版实现。
 
+最新训练前检查见 [README.role-effect-audit.md](README.role-effect-audit.md)。本机角色标注仍只有 **2/600 配对**；默认完整训练会在分配模型前拒绝缺失标注，不能直接拿 smoke 数据启动完整角色监督实验。
+
 代码基于 `RGB-Readout-State` 的因果观测接入；正式训练默认从原始 `zero-wam-pretrain` 初始化，**不要求已有 RGB checkpoint**。保留原始视频、动作、MCP 和 WALA RGB 辅助目标。源码/论文依据及近邻重叠见 [README.role-effect-sources.md](README.role-effect-sources.md)。
 
 ## 方法与实际接口
@@ -13,7 +15,7 @@
 | 原变量名 | 展示名称 | 实际内容 |
 | --- | --- | --- |
 | binding tokens | 对象特征 tokens | 每个 clip 首帧的两个角色区域 DINO 均值、二维中心和尺度，经 MLP 投影。 |
-| effect tokens | 变化特征 tokens | 区域 DINO 特征差、二维中心/尺度差、两个区域相对中心差的变化，经投影和注意力汇总。 |
+| effect tokens | 变化特征 tokens | 区域 DINO 特征差、二维中心/尺度差、两个区域相对中心差的变化，经投影、片段内时间编码和注意力汇总。 |
 | robot role binder | 示范引导的区域匹配 | 当前 Wan 观测先选择相关的示范对象特征，再预测当前场景两个角色区域并加权汇总。 |
 
 这些可归入对象中心表征和状态变化表征；本分支的具体二分方式与实现是设计假设，不是直接复现 DINOSAUR 或完整 WALA。两枚变化 tokens 是两个可学习汇总 query，不分别等同于“平移/旋转”或两个语义动作。`relation_future` 只监督二维相对中心位移，不包含接触、inside/on 或三维关系分类。
@@ -25,6 +27,8 @@
 3. 机器人 role binder 从**当前实际观察**的 Wan patch embeddings 中选择角色区域，和示范的 binding/effect 一起形成策略条件。当前只有 cam_high 有角色教师，因此角色 query/pooling 限定该视图；原策略与基础 readout 仍使用三路相机。
 4. 共享辅助 decoder 预测该机器人对象的未来 DINO 区域变化与二维相对中心变化。未来帧、未来 masks、实体 ID 只进入目标和有效性判断。
 5. 显式 reviewed donor 只替换 effect tokens，保留接收样本的当前机器人场景、binding、未来目标。microbatch=1 时也确实额外加载另一段 human video；不使用 batch 内自交换。
+
+2026-11-19 修正：新训练配置显式使用 `role_effect_temporal_encoding="learned"`。此前 effect 注意力汇总没有片段内时间编码，固定首帧后交换后续帧会得到相同表示。现在投影后的逐帧变化加入可学习时间向量再汇总；这与原 WALA 编码器使用时间 embedding 的做法一致，不作为新的 C2 贡献。旧 checkpoint 缺少该配置时仍使用原结构，防止静默改变已保存权重的解释；新结构从原始 pretrained 开始训练。
 
 每 clip 保留 4 个原 WALA tokens，增加 2 个 binding 与 2 个 effect tokens；8 clips 共 64 个 memory tokens，readout 输出 32 tokens。原始 human Wan context 仍保留。因此需要 **RGB、RGB+State、相同数据/监督但无 factorization 或 donor 的消融**，不能把相对于 RGB 的全部变化归因于角色分路。
 
@@ -39,12 +43,15 @@
 ```text
 human_masks [S,T,2,P], human_valid [S,T,2]
 robot_masks [Tr,2,P], robot_valid [Tr,2]
+human_entity_ids [S,T,2]（未声明全程稳定角色时必须显式给出）
 robot_entity_ids [Tr,2]（角色更换实体时必须显式给出）
 human_frame_indices, robot_frame_indices
 metadata: schema, pair_key, 原 RGB 文件 SHA256, teacher revision, provenance
 ```
 
 全程稳定角色可以在 loader 中生成固定实体 IDs。角色切换时，跨不同实体的未来差分被屏蔽，不把“前面的鼠标”减去“后面的篮子”。未标注样本使用 false validity，不能作为背景负标签。
+
+**human 侧每个 clip 内的两个角色必须各自指向同一实体。** 不同 clips 可以使用不同实体，但当前实现不能在一个 clip 中途把 source 从 A 换成 C 后继续作差。预检现在显式拒绝这种标注，也会拒绝 `stable_roles=True` 与实际实体 ID 不一致的 donor。多阶段数据需按 clip 保持对象一致或重新切分示范；仅写 `role_events` 并不能让当前模型自动解决对象切换。
 
 首版 donor 限定到明确审核的**单一关系效果且角色稳定**的视频。必须记录 relation、direction、source/reference 类型、affordance、不同视频来源和批准理由。任务名一致不能自动建立 donor。多阶段任务仍可参与原策略与有效区间的局部监督，但不自动交换整段效果。
 
@@ -89,9 +96,13 @@ bash script/smoke_role_effect.sh
 
 smoke 显式允许部分监督、禁用 W&B；并不等价于正式训练。运行指标在 `$ZERO_WAM_SAVE_ROOT/metrics.jsonl`，保存的 `COMPLETE.json` 包含 smoke 标记和 role manifest hash/覆盖率。
 
+保存沿用原分支的 **BF16 weights-only** 格式，可严格重载模型做推理；不保存 Adam、scheduler、RNG 和数据迭代状态，因此不支持精确断点续训。加载模型权重重新训练不等同于恢复原优化过程。
+
 ## 本机验证与后续实验
 
 实际执行状态及产物见 [README.role-effect-validation.md](README.role-effect-validation.md)。少量真实样本、梯度检查、保存加载和离线两 chunk 推理仅证明代码链路，不能证明未见任务成功率提升。
+
+`tools/check_role_effect_learning.py` 可在已审核的真实样本上进行有界拟合检查：从随机初始化的新模块开始，冻结原 Wan patch projection，检查各辅助分支的梯度及损失是否下降，并与“始终预测无变化”的基线比较。它不训练完整策略，也不产生可用于报告任务成功率的 checkpoint。复现命令和数值见最新审查记录。
 
 研究验证应首先固定原 pretrained、12任务、训练预算、测试种子与 human demo；增加 RGB+State 和相同标签资源的控制组，再分别去掉角色监督、局部未来、donor交换。用错误绑定/错误效果/不同视角的示范干预检验模型是否真的使用了预期变量；任务评测仍按每任务100次并保留逐seed结果。
 

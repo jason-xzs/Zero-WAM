@@ -126,3 +126,56 @@ def test_future_coverage_uses_real_causal_chunks_and_entity_identity():
     assert usable_future_pairs(valid, ids, 8) == (2, 1)
     ids[7, 0] = 2
     assert usable_future_pairs(valid, ids, 8) == (1, 0)
+
+
+def _update_annotation(path, records, transform):
+    annotation_path = Path(records[0]['annotation_file'])
+    annotation = torch.load(annotation_path, weights_only=True)
+    transform(annotation)
+    torch.save(annotation, annotation_path)
+    records[0]['annotation_sha256'] = file_sha256(annotation_path)
+    _write(path, records)
+
+
+def test_changing_human_identity_inside_a_clip_is_rejected(tmp_path):
+    path, records, payloads = _fixture(tmp_path)
+    records[0].pop('donor_pair_key')
+    records[0]['stable_roles'] = False
+    def change(annotation):
+        annotation['human_entity_ids'] = torch.tensor([[[0, 1], [2, 1]], [[2, 1], [2, 1]]])
+        annotation['robot_entity_ids'] = torch.tensor([[0, 1], [2, 1], [2, 1]])
+    _update_annotation(path, records, change)
+    with pytest.raises(ValueError, match='within.*human clip'):
+        RoleManifest(path, ['place_mouse_pad']).load('0:pair', *payloads[0])
+
+
+def test_different_human_clips_can_have_different_stable_entities(tmp_path):
+    path, records, payloads = _fixture(tmp_path)
+    records[0].pop('donor_pair_key')
+    records[0]['stable_roles'] = False
+    def change(annotation):
+        annotation['human_entity_ids'] = torch.tensor([[[0, 1], [0, 1]], [[2, 0], [2, 0]]])
+        annotation['robot_entity_ids'] = torch.tensor([[0, 1], [0, 1], [2, 0]])
+    _update_annotation(path, records, change)
+    labels, _, donor_valid = RoleManifest(path, ['place_mouse_pad']).load('0:pair', *payloads[0])
+    assert not donor_valid
+    assert labels['human_entity_ids'][1, 0].tolist() == [2, 0]
+
+
+@pytest.mark.parametrize('kind', ['human', 'robot'])
+def test_donor_stable_role_declaration_must_match_actual_entity_ids(tmp_path, kind):
+    path, records, payloads = _fixture(tmp_path)
+    def change(annotation):
+        shape = annotation[f'{kind}_valid'].shape
+        ids = torch.tensor([0, 1]).expand(shape).clone()
+        ids[-1, ..., 0] = 2
+        annotation[f'{kind}_entity_ids'] = ids
+    _update_annotation(path, records, change)
+    with pytest.raises(ValueError, match='stable_roles'):
+        RoleManifest(path, ['place_mouse_pad']).load('0:pair', *payloads[0])
+
+
+def test_unknown_entities_are_not_counted_as_usable_future_targets():
+    valid = torch.ones(4, 2, dtype=torch.bool)
+    ids = torch.full((4, 2), -1, dtype=torch.int64)
+    assert usable_future_pairs(valid, ids, 2) == (0, 0)

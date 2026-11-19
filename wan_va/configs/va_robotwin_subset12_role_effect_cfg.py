@@ -21,6 +21,7 @@ def make_role_effect_config():
     cfg.role_require_complete = partial == "0"
     cfg.rgb_transition_config.update(
         role_effect_enabled=True,
+        role_effect_temporal_encoding="learned",
         role_num_robot_views=3,
         role_human_weight=1.0,
         role_robot_weight=1.0,

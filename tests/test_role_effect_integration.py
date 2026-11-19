@@ -16,6 +16,7 @@ def role_model():
     cfg = dict(tiny_model().config)
     cfg["rgb_transition_config"] = dict(cfg["rgb_transition_config"],
         role_effect_enabled=True, readout_mode="state", readout_num_tokens=4,
+        role_effect_temporal_encoding="learned",
         role_num_robot_views=1)
     return WanICLTransformer3DModel.from_config(cfg).eval()
 
@@ -117,3 +118,21 @@ def test_wrong_robot_timeline_is_rejected_before_role_readout():
     inputs["rgb_transition"]["role_targets"].pop("robot_valid")
     with pytest.raises(ValueError, match="complete Wan frame timeline"):
         model(inputs, train_mode=True)
+
+
+def test_action_objective_itself_reaches_role_and_effect_parameters():
+    model = role_model()
+    # A zero gate intentionally preserves the base model at initialization.
+    # After the gate opens, action gradients must reach the new representation
+    # without any assistance from video reconstruction or auxiliary targets.
+    model.rgb_transition.gate.data.fill_(0.5)
+    output = model(role_inputs(), train_mode=True)
+    output['base_pred'][1].float().square().mean().backward()
+    for name in ('binding_projection.0.weight', 'effect_projection.weight',
+                 'effect_time_embedding', 'robot_query_projection.weight'):
+        parameter = dict(model.rgb_transition.named_parameters())[name]
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+        assert parameter.grad.abs().sum() > 0, name
+    # Decoder-only heads do not directly determine the executed action.
+    assert model.rgb_transition.object_decoder[-1].weight.grad is None

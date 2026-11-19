@@ -22,6 +22,7 @@ def config(**overrides):
                   num_heads=3, encoder_layers=1, decoder_layers=1, max_clips=3,
                   max_future_steps=5, max_patches=16, readout_mode="state",
                   readout_num_tokens=4, role_num_robot_views=1,
+                  role_effect_temporal_encoding="learned",
                   feature_normalization="none", role_effect_enabled=True)
     result.update(overrides)
     return result
@@ -207,3 +208,40 @@ def test_roundtrip_and_training_are_finite(dtype):
     restored.load_state_dict(module.state_dict(), strict=True)
     restored_memory, _ = restored(human)
     torch.testing.assert_close(restored.read_tokens(restored_memory, state, positions), tokens, rtol=0, atol=0)
+
+
+def test_effect_memory_distinguishes_order_with_the_same_initial_and_final_states():
+    module = RoleEffectConditioner(config(), 18)
+    human = torch.randn(2, 2, 5, 4, 8)
+    original = module._human_role_memory(human)[1]
+    # The set of frames, initial state and endpoint are identical. Only the
+    # path differs, so a change here requires temporal association, not a delta
+    # between two different endpoints or the original WALA memory branch.
+    reordered = module._human_role_memory(human[:, :, [0, 3, 2, 1, 4]])[1]
+    assert not torch.allclose(original, reordered, atol=1e-6, rtol=1e-6)
+    (original * torch.randn_like(original)).sum().backward()
+    assert module.effect_time_embedding.grad.abs().sum() > 0
+
+
+def test_legacy_role_checkpoint_keeps_its_original_parameter_layout():
+    legacy = config()
+    legacy.pop("role_effect_temporal_encoding")
+    module = RoleEffectConditioner(legacy, 18)
+    assert not any("effect_time_embedding" in key for key in module.state_dict())
+    with pytest.raises(ValueError, match="role_effect_temporal_encoding"):
+        RoleEffectConditioner(config(role_effect_temporal_encoding="unrecognized"), 18)
+
+
+def test_missing_donors_do_not_reencode_the_recipient_video(monkeypatch):
+    module = RoleEffectConditioner(config(), 18)
+    human, robot, targets, _, _ = data()
+    calls = []
+    original = module._memory
+    def record(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(module, "_memory", record)
+    _, _, context = module(human, robot, True, role_targets=targets,
+        donor_human_features=human, donor_valid=torch.zeros(2, dtype=torch.bool), return_aux_context=True)
+    assert len(calls) == 1
+    assert context['donor_memory'] is None

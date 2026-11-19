@@ -35,8 +35,38 @@ def empty_role_targets(human, robot):
         shape = payload["features"].shape
         result[f"{kind}_masks"] = torch.zeros(*shape[:-2], 2, shape[-2])
         result[f"{kind}_valid"] = torch.zeros(*shape[:-2], 2, dtype=torch.bool)
-    result['robot_entity_ids'] = torch.full((robot['features'].shape[0], 2), -1, dtype=torch.int64)
+        result[f"{kind}_entity_ids"] = torch.full((*shape[:-2], 2), -1, dtype=torch.int64)
     return result
+
+
+def _changing_entities(ids, dim):
+    """Unknown/occluded intervals do not create or erase a known identity."""
+    known = ids >= 0
+    first = ids.masked_fill(~known, torch.iinfo(torch.int64).max).amin(dim)
+    last = ids.amax(dim)
+    return known.any(dim) & (first != last)
+
+
+def validate_role_identities(annotation, kind, valid, stable_roles):
+    ids = annotation.get(f'{kind}_entity_ids')
+    if ids is None and stable_roles:
+        ids = torch.arange(2, dtype=torch.int64).expand(valid.shape).clone()
+    if (not isinstance(ids, torch.Tensor) or ids.dtype != torch.int64
+            or tuple(ids.shape) != tuple(valid.shape) or torch.any(ids < -1)):
+        raise ValueError(f"Changing/unknown role identity requires explicit {kind}_entity_ids")
+    if torch.any(valid & (ids < 0)):
+        raise ValueError("Valid role labels need persistent object identity")
+    if torch.any((ids[..., 0] >= 0) & (ids[..., 0] == ids[..., 1])):
+        raise ValueError("Source and reference must identify distinct entities")
+    if stable_roles and _changing_entities(ids.reshape(-1, 2), dim=0).any():
+        raise ValueError(f"stable_roles=True contradicts actual {kind}_entity_ids")
+    if kind == 'human' and _changing_entities(ids, dim=1).any():
+        raise ValueError(
+            "Role identity changes within a human clip: object differences would mix distinct entities. "
+            "Use clips/annotations with consistent objects within each clip; the current model does "
+            "not support an intra-clip role switch."
+        )
+    return ids
 
 
 class RoleManifest:
@@ -100,6 +130,8 @@ class RoleManifest:
         metadata = annotation.get("metadata", {})
         if metadata.get("schema_version") != 1 or metadata.get("pair_key") != pair_key:
             raise ValueError("Role annotation schema/pair identity mismatch")
+        if metadata.get("role_order", ["source", "reference"]) != ["source", "reference"]:
+            raise ValueError("Role annotation order must be [source, reference]")
         result = {}
         for kind, payload in (("human", human), ("robot", robot)):
             if metadata.get(f"{kind}_cache_sha256") != record[f"{kind}_cache_sha256"]:
@@ -119,16 +151,8 @@ class RoleManifest:
             if torch.any(valid & (masks.sum(-1) <= 0)):
                 raise ValueError("Visible valid roles must have nonempty masks; mark occlusions invalid")
             result[f"{kind}_masks"], result[f"{kind}_valid"] = masks.float(), valid
-        entity_ids = annotation.get('robot_entity_ids')
-        if entity_ids is None and record.get('stable_roles') is True:
-            entity_ids = torch.arange(2, dtype=torch.int64).expand(robot['features'].shape[0], 2).clone()
-        if (not isinstance(entity_ids, torch.Tensor) or entity_ids.dtype != torch.int64
-                or tuple(entity_ids.shape) != tuple(result['robot_valid'].shape)
-                or torch.any(entity_ids < -1)):
-            raise ValueError("Changing/unknown role identity requires explicit robot_entity_ids [T,2]")
-        if torch.any(result['robot_valid'] & (entity_ids < 0)):
-            raise ValueError("Valid role labels need persistent object identity")
-        result['robot_entity_ids'] = entity_ids
+            result[f"{kind}_entity_ids"] = validate_role_identities(
+                annotation, kind, valid, stable_roles=record.get('stable_roles') is True)
         if require_complete:
             human_counts = result['human_valid'].reshape(-1, 2).sum(0)
             robot_counts = result['robot_valid'].sum(0)
@@ -158,7 +182,8 @@ def usable_future_pairs(valid, identities, chunk_size):
         observed = max(start - 1, 0)
         end = min(start + chunk_size, valid.shape[0])
         for future in range(max(start, observed + 1), end):
-            usable = valid[observed] & valid[future] & (identities[observed] == identities[future])
+            usable = (valid[observed] & valid[future] & (identities[observed] >= 0)
+                      & (identities[observed] == identities[future]))
             objects += int(usable.sum())
             relations += int(usable.all())
     return objects, relations
@@ -171,6 +196,15 @@ def validate_role_feature_cache(config):
     full_config = deepcopy(config)
     full_config.rgb_smoke_sample_ids = None
     permitted = {rgb_pair_key(record['sample']): record for record in expected_rgb_records(full_config)}
+    selected_records = list(expected_rgb_records(config))
+    selected_keys = {rgb_pair_key(record['sample']) for record in selected_records}
+    missing = selected_keys - manifest.records.keys()
+    if config.role_require_complete and missing:
+        raise ValueError(
+            f"Missing reviewed role annotations: {len(selected_keys) - len(missing)}/{len(selected_keys)} "
+            f"selected pairs annotated; {len(missing)} missing. Prepare complete labels before full training. "
+            f"First missing pair: {sorted(missing)[0]}"
+        )
     for key, annotation in manifest.records.items():
         record = permitted.get(key)
         if record is None or record['task_name'].split('-', 1)[0] != annotation['task_name']:
@@ -186,7 +220,16 @@ def validate_role_feature_cache(config):
     chunk_sizes = [fixed_chunk] if fixed_chunk > 0 else list(range(1, int(config.max_frame_chunk_size) + 1))
     usable_counts = {size: {'object': 0, 'relation': 0} for size in chunk_sizes}
     known_keys = set()
-    for record in expected_rgb_records(config):
+    # Donors outside a smoke selection still need valid sidecars and consistent
+    # identities. A manually entered stable_roles flag alone is insufficient.
+    extra_donors = {manifest.records[key].get('donor_pair_key') for key in selected_keys
+                    if key in manifest.records} - {None} - selected_keys
+    for key in sorted(extra_donors):
+        record = permitted[key]
+        hp, rp = record['human_cache_path'], record['robot_cache_path']
+        manifest.load(key, load_feature_cache(hp, 'human'), load_feature_cache(rp, 'robot'), hp, rp,
+                      require_complete=config.role_require_complete)
+    for record in selected_records:
         # Same record enumeration and exact pair keys as the RGB preflight.
         key = rgb_pair_key(record["sample"])
         known_keys.add(key)

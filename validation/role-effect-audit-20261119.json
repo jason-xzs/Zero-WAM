@@ -1,0 +1,301 @@
+{
+  "date": "2026-11-19",
+  "scope": "Preflight implementation audit; not task success or generalization evaluation",
+  "status": "implementation_checks_passed",
+  "full_training_ready": false,
+  "generalization_evaluated": false,
+  "tests": {
+    "full_suite": 425,
+    "full_suite_seconds": 81.1,
+    "additional_action_gradient_test": "passed; six role integration tests rerun",
+    "unique_tests": 426
+  },
+  "source_sha256": {
+    "wan_va/modules/role_effect.py": "127ae3ac20a6a3290a9eed3f84c399719f88d04fef3bf10d6af234d588a68a2f",
+    "wan_va/dataset/role_feature_cache.py": "f74720c46978e2a13a27cadb7afbb898ce11df0d60decb986ae2cbb955747107",
+    "wan_va/configs/va_robotwin_subset12_role_effect_cfg.py": "02a0136cc58bd0d4b3e21476350efe607a9c696d912876d6fe38f98e35615c33",
+    "wan_va/modules/icl_model.py": "7379adb2f3c41973f22222c83f470847eb76b194b9e0a940e00e1699d69f2ff8",
+    "wan_va/train.py": "5d912e98ce7ca153e7eb553f4e39ed02dc561143442b66df2c3f7491e509d837",
+    "wan_va/wan_va_server.py": "6d50d252a403094bdaf353a3546df1c27eeaa7b5a213f484e24453d49913ef3d",
+    "tools/check_role_effect_learning.py": "03066244a2e121c3af2198093872ba5e654f7b88f515d2847ac0c31d3636ad79"
+  },
+  "training_data": {
+    "total_pairs": 600,
+    "annotated_pairs": 2,
+    "missing_pairs": 598,
+    "complete_mode_rejects_missing_labels": true,
+    "labels": "SAM2 weak labels with Codex visual review; not human GT",
+    "manifest_sha256": "e4eb7c6725470bfc3b06c3a88596b99cc5ecb73d8c733d22c17b552b058dc23f"
+  },
+  "head_fit": {
+    "diagnostic": "in-sample optimization only; no policy or generalization evaluation",
+    "backbone_frozen": true,
+    "initialization": "fresh role/RGB module; released Wan patch projection",
+    "precision": "FP32",
+    "seed": 42,
+    "steps": 200,
+    "learning_rate": 0.0001,
+    "warmup_steps": 0,
+    "chunk_size": 2,
+    "initial": {
+      "human_self": 0.39521797001361847,
+      "human_self_l1": 0.29540640115737915,
+      "human_self_cosine": 0.9981156289577484,
+      "robot_self": 0.919525682926178,
+      "robot_self_l1": 0.8177201151847839,
+      "robot_self_cosine": 1.0180555582046509,
+      "transfer": 0.9195201098918915,
+      "transfer_l1": 0.8175922632217407,
+      "transfer_cosine": 1.0192787051200867,
+      "total": 5.937586784362793,
+      "role_human": 1.6603679656982422,
+      "role_robot": 1.6606276035308838,
+      "object_future": 0.1757689118385315,
+      "relation_future": 0.015427091624587774,
+      "donor_effect": 0.1911313235759735,
+      "effect_order_rms_difference": 5.8320805692346767e-05
+    },
+    "final": {
+      "step": 200,
+      "human_self": 0.2985435277223587,
+      "human_self_l1": 0.22250184416770935,
+      "human_self_cosine": 0.7604169547557831,
+      "robot_self": 0.5567768514156342,
+      "robot_self_l1": 0.5303944051265717,
+      "robot_self_cosine": 0.2638244926929474,
+      "transfer": 0.5567524135112762,
+      "transfer_l1": 0.5303714275360107,
+      "transfer_cosine": 0.2638096809387207,
+      "total": 2.6899681091308594,
+      "role_human": 0.4822053462266922,
+      "role_robot": 0.7139852643013,
+      "object_future": 0.0408127773553133,
+      "relation_future": 4.684300074586645e-05,
+      "donor_effect": 0.04084506444633007,
+      "effect_order_rms_difference": 9.284542466048151e-05
+    },
+    "zero_change_baseline": {
+      "object_future": 0.1593443676829338,
+      "relation_future": 0.0007994122279342264
+    },
+    "future_predictions_beat_zero_change": {
+      "object_future": true,
+      "relation_future": true
+    },
+    "first_step_gradient_norms": {
+      "effect_time_embedding": 0.4490945637226105,
+      "role_patch_projection.weight": 1.4969207048416138,
+      "effect_projection.weight": 0.34975409507751465,
+      "robot_query_projection.weight": 4.318356990814209,
+      "bound_effect_attention.in_proj_weight": 0.7975793480873108,
+      "object_decoder.3.weight": 0.07305116951465607,
+      "relation_decoder.3.weight": 0.9019215703010559
+    },
+    "elapsed_seconds": 85.26934996061027
+  },
+  "full_model": {
+    "optimizer_windows": 20,
+    "optimizer_step_skipped": 0,
+    "all_recorded_scalars_finite": true,
+    "max_gpu_peak_allocated_gib_rank0": 51.61555814743042,
+    "last_gate": 6.319327076198533e-05,
+    "median_seconds_after_first": 12.673596845939755,
+    "gpus": "4 x A800 80GB",
+    "pairs": 14,
+    "tasks": 12,
+    "icl_dropout": 0.1,
+    "verified_model_shards": 8,
+    "weights_only": true
+  },
+  "longest_sequence": {
+    "optimizer_windows": 2,
+    "optimizer_step_skipped": 0,
+    "all_recorded_scalars_finite": true,
+    "max_gpu_peak_allocated_gib_rank0": 49.9988226890564,
+    "last_gate": 4.990972684026929e-07,
+    "median_seconds_after_first": 15.569279605522752,
+    "gpus": "4 x A800 80GB",
+    "pairs": 15,
+    "tasks": 12,
+    "icl_dropout": 0.0,
+    "max_robot_frames_in_full_600_pairs": 35,
+    "longest_pair": "416:8adb68a30436bc0f",
+    "checkpoint_saved": false
+  },
+  "inference": {
+    "status": "passed",
+    "seed": 42,
+    "task_success_evaluated": false,
+    "sampling": {
+      "video_steps": 50,
+      "action_steps": 50,
+      "icl_guidance_scale": 5.0,
+      "target_text_cfg": -1
+    },
+    "checkpoint_loading_info": {
+      "missing_keys": [],
+      "unexpected_keys": [],
+      "mismatched_keys": [],
+      "error_msgs": []
+    },
+    "saved_rgb_gate": {
+      "value": 6.341934204101562e-05,
+      "dtype": "torch.bfloat16",
+      "finite": true,
+      "nonzero": true
+    },
+    "first_chunk": {
+      "shape": [
+        16,
+        2,
+        16
+      ],
+      "finite": true,
+      "min": -0.1675359457731247,
+      "max": 1.0312509536743164,
+      "seconds": 14.256287487223744,
+      "cache": {
+        "0": 0,
+        "1": 756,
+        "2": 2240
+      },
+      "readout_calls": 51
+    },
+    "second_chunk": {
+      "shape": [
+        16,
+        2,
+        16
+      ],
+      "finite": true,
+      "min": -0.31567105650901794,
+      "max": 1.0156259536743164,
+      "seconds": 17.322025863453746
+    },
+    "peak_gpu_allocated_gb": 37.286280704,
+    "total_seconds": 285.76715559884906,
+    "state_intervention": {
+      "shape": [
+        1,
+        32,
+        256
+      ],
+      "max_abs": 0.40283203125,
+      "state_sensitive": true,
+      "input": "synthetic perturbation only to readout state; main query and caches fixed",
+      "conditional_output_change": {
+        "max_abs": 0.3828125,
+        "mean_abs": 0.00889501255005598,
+        "rms": 0.013134844601154327,
+        "reference_rms": 1.2639870643615723,
+        "allclose_1e2": false
+      },
+      "negative_output_change": {
+        "max_abs": 0.0,
+        "mean_abs": 0.0,
+        "rms": 0.0,
+        "reference_rms": 1.2110297679901123,
+        "allclose_1e2": true
+      }
+    },
+    "cfg_and_reset": {
+      "rgb_conditioner_calls": [
+        {
+          "human_feature_shape": [
+            1,
+            8,
+            4,
+            256,
+            768
+          ]
+        },
+        {
+          "human_feature_shape": [
+            1,
+            8,
+            4,
+            256,
+            768
+          ]
+        }
+      ],
+      "negative_human_change": {
+        "max_abs": 0.0,
+        "mean_abs": 0.0,
+        "rms": 0.0,
+        "reference_rms": 1.2110297679901123,
+        "allclose_1e2": true
+      },
+      "conditional_human_change": {
+        "max_abs": 0.905517578125,
+        "mean_abs": 0.05184875801205635,
+        "rms": 0.07363726198673248,
+        "reference_rms": 1.2639870643615723,
+        "allclose_1e2": false
+      },
+      "bf16_assert_atol": 0.01,
+      "bf16_assert_rtol": 0.01,
+      "no_icl_cache": {},
+      "negative_vs_no_cache_same_packing": {
+        "max_abs": 0.0,
+        "mean_abs": 0.0,
+        "rms": 0.0,
+        "reference_rms": 1.2110297679901123,
+        "allclose_1e2": true
+      },
+      "negative_vs_single_stream": {
+        "max_abs": 0.4921875,
+        "mean_abs": 0.009932013228535652,
+        "rms": 0.014985192567110062,
+        "reference_rms": 1.2110297679901123,
+        "allclose_1e2": false
+      },
+      "rgb_disabled_same_checkpoint": {
+        "negative_vs_rgb_enabled": {
+          "max_abs": 0.0,
+          "mean_abs": 0.0,
+          "rms": 0.0,
+          "reference_rms": 1.2110297679901123,
+          "allclose_1e2": true
+        },
+        "conditional_vs_rgb_enabled": {
+          "max_abs": 0.2421875,
+          "mean_abs": 0.008708321489393711,
+          "rms": 0.01191463228315115,
+          "reference_rms": 1.2640376091003418,
+          "allclose_1e2": false
+        },
+        "negative_vs_no_cache_same_packing": {
+          "max_abs": 0.0,
+          "mean_abs": 0.0,
+          "rms": 0.0,
+          "reference_rms": 1.2110297679901123,
+          "allclose_1e2": true
+        },
+        "negative_vs_single_stream": {
+          "max_abs": 0.4921875,
+          "mean_abs": 0.009932013228535652,
+          "rms": 0.014985192567110062,
+          "reference_rms": 1.2110297679901123,
+          "allclose_1e2": false
+        },
+        "single_stream_delta_vs_rgb_enabled": {
+          "max_abs": 0.0,
+          "mean_abs": 0.0,
+          "rms": 0.0,
+          "reference_rms": 0.014985192567110062,
+          "allclose_1e2": true
+        },
+        "rgb_conditioner_calls_unchanged": true
+      }
+    }
+  },
+  "checkpoint_exact_training_resume_supported": false,
+  "limitations": [
+    "Only 2 of 600 role-labelled pairs available locally.",
+    "Human identities must remain consistent within each clip.",
+    "2D region geometry is not metric 3D or contact state.",
+    "Positive donor supervision alone does not prove disentanglement or generalization.",
+    "Weights-only checkpoints do not restore Adam/scheduler/RNG/sampler state."
+  ]
+}

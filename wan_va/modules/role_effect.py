@@ -74,6 +74,14 @@ completeness and donor semantic eligibility are validated by the dataset.
         self.object_horizon = nn.Parameter(torch.randn(self.max_future_steps, h) * 0.02)
         self.object_decoder = nn.Sequential(nn.LayerNorm(h), nn.Linear(h, h), nn.SiLU(), nn.Linear(h, d))
         self.relation_decoder = nn.Sequential(nn.LayerNorm(2 * h), nn.Linear(2 * h, h), nn.SiLU(), nn.Linear(h, 2))
+        # Old smoke checkpoints did not encode the order of the future frames.
+        # Preserve their exact layout/behavior when the key is absent. New
+        # training explicitly enables this and saves it in the model config.
+        self.role_effect_temporal_encoding = config.get("role_effect_temporal_encoding", "none")
+        if self.role_effect_temporal_encoding not in {"none", "learned"}:
+            raise ValueError("role_effect_temporal_encoding must be 'none' or 'learned'")
+        if self.role_effect_temporal_encoding == "learned":
+            self.effect_time_embedding = nn.Parameter(torch.randn(self.max_future_steps, h) * 0.02)
 
     def _zero(self):
         # Every rank must retain all parameters even when its labels are absent.
@@ -118,6 +126,8 @@ completeness and donor semantic eligibility are validated by the dataset.
         delta_relation = relation[:, :, 1:] - relation[:, :, :1]
         effect_input = self.effect_projection(torch.cat((delta_features, delta_geometry, delta_relation), -1))
         effect_input = effect_input.reshape(b * s, t - 1, self.hidden_dim)
+        if self.role_effect_temporal_encoding == "learned":
+            effect_input = effect_input + self.effect_time_embedding[None, :t - 1].to(effect_input.dtype)
         queries = self.effect_queries[None].expand(b * s, -1, -1)
         effect, _ = self.effect_attention(queries, effect_input, effect_input, need_weights=False)
         effect = self.effect_norm(queries + effect).reshape(b, s, 2, self.hidden_dim)
@@ -213,7 +223,8 @@ completeness and donor semantic eligibility are validated by the dataset.
                 donor_human_features = donor_human_features.to(human_features)
                 if donor_human_features.shape[0] != human_features.shape[0]:
                     raise ValueError("Donor batch does not match recipient")
-                donor_memory, _, _ = self._memory(donor_human_features)
+                if bool(donor_valid.any()):
+                    donor_memory, _, _ = self._memory(donor_human_features)
             elif donor_valid is not None and bool(donor_valid.any()):
                 raise ValueError("Valid donor requires donor_human_features")
             context = {"targets": targets,
