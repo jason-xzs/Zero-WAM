@@ -360,6 +360,7 @@ class ICLLeRobotLatentDataset(LatentLeRobotDataset):
                     human_feature_path(root, human_latent_file),
                     robot_feature_path(root, self.root.name, self.used_video_keys[0], meta),
                     require_complete=self.config.role_require_complete,
+                    require_record=getattr(self.config, 'role_require_all_records', False),
                 )
                 item.update(role_targets=roles, donor_human_features=donor, donor_valid=donor_valid)
         return item

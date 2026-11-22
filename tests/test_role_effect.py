@@ -39,6 +39,60 @@ def data():
     return human, robot, targets, state, positions
 
 
+def test_sparse_visibility_does_not_imply_geometric_or_effect_supervision():
+    module = RoleEffectConditioner(config(role_future_target_mode='all_reviewed'), 18)
+    human, robot, targets, state, positions = data()
+    targets['robot_effect_valid'] = torch.zeros_like(targets['robot_valid'])
+    targets['robot_relation_valid'] = torch.zeros_like(targets['robot_valid'])
+    memory, _, ctx = module(human, robot, True, role_targets=targets, return_aux_context=True)
+    tokens, losses = module.training_read_tokens(memory, state, positions,
+        aux_context=ctx, observed_index=0, future_indices=[1])
+    assert losses['role_robot'] > 0
+    assert losses['object_future'] == 0 and losses['relation_future'] == 0
+    torch.testing.assert_close(tokens, module.read_tokens(memory, state, positions), rtol=0, atol=0)
+    sum(losses.values()).backward()
+    assert module.robot_query_projection.weight.grad.abs().sum() > 0
+
+
+def test_incompatible_demo_masks_cross_losses_without_changing_policy_input():
+    module = RoleEffectConditioner(config(), 18)
+    human, robot, targets, state, positions = data()
+    targets['cross_effect_valid'] = torch.zeros(2, dtype=torch.bool)
+    memory, losses, ctx = module(human, robot, True, role_targets=targets,
+        donor_human_features=human.flip(0), donor_valid=torch.ones(2, dtype=torch.bool),
+        return_aux_context=True)
+    assert losses['transfer'] == 0
+    assert losses['human_self'] > 0 and losses['robot_self'] > 0
+    tokens, read_losses = module.training_read_tokens(memory, state, positions,
+        aux_context=ctx, observed_index=0, future_indices=[1, 2])
+    assert read_losses['role_robot'] > 0
+    assert all(read_losses[key] == 0 for key in ('object_future', 'relation_future', 'donor_effect'))
+    inference_memory, _ = module(human)
+    torch.testing.assert_close(tokens, module.read_tokens(inference_memory, state, positions), rtol=0, atol=0)
+
+
+def test_reviewed_long_gap_targets_are_train_only_and_identity_checked():
+    module = RoleEffectConditioner(config(role_future_target_mode='all_reviewed'), 18)
+    human, robot, targets, state, positions = data()
+    targets['robot_effect_valid'] = torch.zeros_like(targets['robot_valid'])
+    targets['robot_effect_valid'][:, [0, 3]] = True
+    targets['robot_relation_valid'] = targets['robot_effect_valid'].clone()
+    targets['robot_entity_ids'] = torch.arange(2).expand(2, 4, 2).clone()
+    memory, _, ctx = module(human, robot, True, role_targets=targets, return_aux_context=True)
+    tokens, losses = module.training_read_tokens(memory, state, positions,
+        aux_context=ctx, observed_index=0, future_indices=[1])
+    assert losses['object_future'] > 0 and losses['relation_future'] > 0
+    ctx['targets']['robot_entity_ids'][:, 3] += 2
+    other_tokens, changed = module.training_read_tokens(memory, state, positions,
+        aux_context=ctx, observed_index=0, future_indices=[1])
+    assert changed['object_future'] == 0 and changed['relation_future'] == 0
+    torch.testing.assert_close(tokens, other_tokens, rtol=0, atol=0)
+    module.role_future_target_mode = 'chunk'
+    _, chunk_losses = module.training_read_tokens(memory, state, positions,
+        aux_context=ctx, observed_index=0, future_indices=[1])
+    assert chunk_losses['object_future'] == 0
+
+
 def test_factory_is_opt_in_and_zero_gate_preserves_hidden():
     assert type(build_rgb_transition_conditioner(config(role_effect_enabled=False), 18)) is RGBTransitionConditioner
     module = build_rgb_transition_conditioner(config(), 18)

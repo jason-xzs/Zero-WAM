@@ -27,7 +27,12 @@ Gaps remain unknown (valid=False, entity_id=-1); roles are never inferred from
 task names or neighboring events. Overlapping/out-of-range events, unknown or
 identical role IDs, and malformed boxes are rejected. Numeric object IDs remain
 unchanged; named IDs receive deterministic integers recorded in role_seed_plan.
-All entity boxes currently refer to frame 0. Optional invalid_intervals retain
+Explicit objects may also supply points_xy and point_labels (1=foreground,
+0=background), in original seed-frame pixels, alongside their box. These are
+observed prompts, never reviewed masks or a substitute for candidate review.
+All entity boxes refer to seed_frame (default 0). A later visible seed is
+allowed: earlier frames remain unknown, with zero supervision and no backward
+propagation. Optional invalid_intervals retain
 their legacy role-scoped meaning. Multi-stage support does not imply that any
 real multi-stage data have been annotated or reviewed.
 """
@@ -124,19 +129,34 @@ def _object_id(value):
     return value
 
 
+def _validate_points(value, width, height):
+    points, labels = value.get('points_xy'), value.get('point_labels')
+    if (not isinstance(points, list) or not points or not isinstance(labels, list)
+            or len(labels) != len(points) or any(type(x) is not int or x not in (0, 1) for x in labels)):
+        raise ValueError('Correction requires matching points_xy and binary point_labels')
+    for point in points:
+        if (not isinstance(point, (list, tuple)) or len(point) != 2
+                or any(isinstance(x, bool) or not isinstance(x, (int, float)) or not np.isfinite(x) for x in point)
+                or not (0 <= point[0] < width and 0 <= point[1] < height)):
+            raise ValueError('Correction points must be finite original-frame pixels')
+    return {'points_xy': [list(point) for point in points], 'point_labels': list(labels)}
+
+
 def normalize_role_seeds(seeds, frame_count, width, height):
     """Validate explicit role events and create persistent entity IDs on CPU."""
-    if seeds.get("seed_frame", 0) != 0:
-        raise ValueError("Seeds must refer to frame 0; no backward extrapolation")
     if not isinstance(frame_count, int) or frame_count < 1:
         raise ValueError("Video frame count must be positive")
+    seed_frame = seeds.get("seed_frame", 0)
+    if (isinstance(seed_frame, bool) or not isinstance(seed_frame, int)
+            or not 0 <= seed_frame < frame_count):
+        raise ValueError("seed_frame must be an original-video frame inside the video")
     legacy = "objects" not in seeds
     if legacy:
         boxes = seeds.get("boxes_xyxy", {})
         if set(boxes) != set(ROLES) or "role_events" in seeds:
             raise ValueError("Legacy seeds require source/reference boxes and no role_events")
         objects = {str(i): {"box_xyxy": boxes[role]} for i, role in enumerate(ROLES)}
-        events = [{"start_frame": 0, "end_frame": frame_count-1,
+        events = [{"start_frame": seed_frame, "end_frame": frame_count-1,
                    "source": "0", "reference": "1"}]
     else:
         if "boxes_xyxy" in seeds:
@@ -156,6 +176,37 @@ def normalize_role_seeds(seeds, frame_count, width, height):
                 or not (0 <= box[0] < box[2] <= width and 0 <= box[1] < box[3] <= height)):
             raise ValueError(f"Invalid original-pixel box for object {key}: {box}")
         normalized[key] = {"external_id": key, "box_xyxy": list(box)}
+        corrections = value.get('corrections', [])
+        if not isinstance(corrections, list):
+            raise ValueError('corrections must be a list of reviewed frame prompts')
+        frames = set()
+        checked = []
+        for correction in corrections:
+            if not isinstance(correction, dict):
+                raise ValueError('Malformed correction prompt')
+            frame = correction.get('frame')
+            if (type(frame) is not int or not seed_frame < frame < frame_count or frame in frames
+                    or not isinstance(correction.get('review'), str) or not correction['review'].strip()):
+                raise ValueError('Correction needs a unique later frame and explicit visual review')
+            checked.append(dict(frame=frame, review=correction['review'],
+                                **_validate_points(correction, width, height)))
+            frames.add(frame)
+        if checked:
+            normalized[key]['corrections'] = sorted(checked, key=lambda x: x['frame'])
+        if "points_xy" in value or "point_labels" in value:
+            points, labels = value.get("points_xy"), value.get("point_labels")
+            if (not isinstance(points, list) or not points
+                    or not isinstance(labels, list) or len(labels) != len(points)
+                    or any(type(label) is not int or label not in (0, 1) for label in labels)):
+                raise ValueError(f"Invalid point prompts for object {key}")
+            for point in points:
+                if (not isinstance(point, (list, tuple)) or len(point) != 2
+                        or any(isinstance(x, bool) or not isinstance(x, (int, float))
+                               or not np.isfinite(x) for x in point)
+                        or not (0 <= point[0] < width and 0 <= point[1] < height)):
+                    raise ValueError(f"Invalid original-pixel point for object {key}: {point}")
+            normalized[key].update(points_xy=[list(point) for point in points],
+                                   point_labels=list(labels))
     used_ids = {int(key) for key in normalized if key.isdigit()}
     entity_ids = {key: int(key) for key in normalized if key.isdigit()}
     for key in sorted(set(normalized)-set(entity_ids)):
@@ -174,7 +225,7 @@ def normalize_role_seeds(seeds, frame_count, width, height):
         start, end = event.get("start_frame"), event.get("end_frame")
         if (isinstance(start, bool) or isinstance(end, bool)
                 or not isinstance(start, int) or not isinstance(end, int)
-                or not 0 <= start <= end < frame_count):
+                or not seed_frame <= start <= end < frame_count):
             raise ValueError(f"Role event has invalid/out-of-video bounds: {event}")
         selected = {role: _object_id(event.get(role)) for role in ROLES}
         if any(key not in normalized for key in selected.values()):
@@ -193,7 +244,7 @@ def normalize_role_seeds(seeds, frame_count, width, height):
                     or any(isinstance(x, bool) or not isinstance(x, int) for x in interval)
                     or not 0 <= interval[0] <= interval[1] < frame_count):
                 raise ValueError(f"Invalid role-specific exclusion interval: {role}/{interval}")
-    return {"legacy_two_role_schema": legacy, "objects": object_list,
+    return {"legacy_two_role_schema": legacy, "seed_frame": seed_frame, "objects": object_list,
             "role_events": normalized_events, "invalid_intervals": intervals,
             "event_bounds": "inclusive original-video frame indices"}
 
@@ -305,9 +356,11 @@ def save_overlay(image, masks, frame, stats, path):
         # Rejected candidates remain visible for review but are never labels.
         tint = np.array(color if stats[role_index]["valid"] else (245, 180, 30))
         pixels[mask] = .58 * pixels[mask] + .42 * tint
-    overlay = Image.fromarray(np.uint8(np.clip(pixels, 0, 255)))
+    # Keep the entire decoded frame visible, including objects near its top edge.
+    tinted = Image.fromarray(np.uint8(np.clip(pixels, 0, 255)))
+    overlay = Image.new("RGB", (tinted.width, tinted.height + 52), (15, 15, 15))
+    overlay.paste(tinted, (0, 52))
     draw = ImageDraw.Draw(overlay)
-    draw.rectangle((0, 0, overlay.width, 51), fill=(15, 15, 15))
     draw.text((7, 5), f"frame={frame} | UNREVIEWED SAM2 weak label | red=source cyan=reference amber=invalid", fill="white")
     for i, item in enumerate(stats):
         text = f"{ROLES[i]} id={item.get('entity_id', i)} valid={item['valid']} p={item['object_probability']} area={item['visible_pixels']}"
@@ -354,12 +407,44 @@ def process_video(predictor, record, kind, seeds, output, args):
     state = predictor.init_state(str(output / "sam2_input_frames"), offload_video_to_cpu=True,
                                  offload_state_to_cpu=True)
     for obj in plan["objects"]:
-        predictor.add_new_points_or_box(state, frame_idx=0, obj_id=obj["sam_id"],
-                                        box=np.array(obj["box_xyxy"], dtype=np.float32))
+        point_prompt = {}
+        if "points_xy" in obj:
+            point_prompt = {"points": np.array(obj["points_xy"], dtype=np.float32),
+                            "labels": np.array(obj["point_labels"], dtype=np.int32)}
+        predictor.add_new_points_or_box(state, frame_idx=plan["seed_frame"], obj_id=obj["sam_id"],
+                                        box=np.array(obj["box_xyxy"], dtype=np.float32),
+                                        **point_prompt)
+    # SAM2's supported offline interactive refinement. Future prompts are
+    # annotation evidence, never inputs to the policy. Re-review ALL resulting
+    # sampled masks because conditioning on a correction may change others.
+    for obj in plan['objects']:
+        for correction in obj.get('corrections', []):
+            predictor.add_new_points_or_box(state, frame_idx=correction['frame'], obj_id=obj['sam_id'],
+                points=np.array(correction['points_xy'], dtype=np.float32),
+                labels=np.array(correction['point_labels'], dtype=np.int32))
     masks_by_frame, valid_by_frame, stats_by_frame = {}, {}, {}
     entity_ids_by_frame, object_stats_by_frame = {}, {}
     overlays, seed_areas = [], None
-    for frame, obj_ids, logits in predictor.propagate_in_video(state):
+    # A later observed prompt is not evidence about earlier occluded frames.
+    # Retain every cache timestamp and its PNG, but supervise none before it.
+    for frame in range(plan["seed_frame"]):
+        frame_stats = [{"role": role, "entity_id": -1, "external_object_id": None,
+                        "object_score_logit": None, "object_probability": None,
+                        "visible_pixels": 0, "raw_mask_pixels": 0,
+                        "fraction_of_image": 0., "ratio_to_seed_area": 0.,
+                        "overlap_fraction_removed": 0., "valid": False,
+                        "invalid_reasons": ["before_first_visible_seed"]} for role in ROLES]
+        stats_by_frame[str(frame)] = frame_stats
+        object_stats_by_frame[str(frame)] = []
+        if frame in sampled:
+            masks_by_frame[frame] = torch.zeros((2, 256))
+            valid_by_frame[frame] = torch.zeros(2, dtype=torch.bool)
+            entity_ids_by_frame[frame] = torch.full((2,), -1, dtype=torch.int64)
+            path = output / f"overlay_{frame:06d}.png"
+            save_overlay(sampled[frame], np.zeros((2, info["height"], info["width"]), dtype=bool),
+                         frame, frame_stats, path)
+            overlays.append((frame, path))
+    for frame, obj_ids, logits in predictor.propagate_in_video(state, start_frame_idx=plan["seed_frame"]):
         order = [obj_ids.index(obj["sam_id"]) for obj in plan["objects"]]
         raw = (logits[order, 0].float().cpu().numpy() > 0)
         areas_before = raw.sum(axis=(1, 2))
@@ -494,7 +579,7 @@ def main():
                 "occlusion_policy": "no completion; low-confidence/area/overlap gates and explicit manual invalid_intervals; final visual review required",
                 "gate_settings": {key: getattr(args, key) for key in ("min_object_probability", "min_mask_pixels", "min_area_ratio", "max_area_ratio", "max_overlap_fraction")}}
             annotation["metadata"] = {"schema_version": 1, "pair_key": record["pair_key"], **hashes,
-                "role_order": list(ROLES), "teacher_model": "facebook/sam2.1-hiera-tiny",
+                "role_order": list(ROLES), "teacher_model": "sam2 (see teacher config and checkpoint digest)",
                 "teacher_revision": teacher, "provenance": provenance,
                 "entity_identity_scope": "persistent within each video; explicit role_events only",
                 "role_seed_plans": {kind: report["role_seed_plan"] for kind, report in video_reports.items()}}

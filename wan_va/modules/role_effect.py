@@ -31,6 +31,9 @@ can cache it. The original WALA loss remains independently configurable.
 ``role_targets`` contains human_masks [B,S,T,2,P], human_valid [B,S,T,2],
 robot_masks [B,Tr,2,P], robot_valid [B,Tr,2] and optional robot_entity_ids
 [B,Tr,2] (int64; -1 means unknown). Different identities cannot form a delta.
+Optional robot_effect_valid and robot_relation_valid separately approve
+feature and geometric targets; each is a subset of robot_valid. A per-example
+cross_effect_valid disables semantically incompatible cross-demo targets.
 All are optional together;
 missing targets contribute graph-connected zero losses. Data-manifest
 completeness and donor semantic eligibility are validated by the dataset.
@@ -82,6 +85,11 @@ completeness and donor semantic eligibility are validated by the dataset.
             raise ValueError("role_effect_temporal_encoding must be 'none' or 'learned'")
         if self.role_effect_temporal_encoding == "learned":
             self.effect_time_embedding = nn.Parameter(torch.randn(self.max_future_steps, h) * 0.02)
+        # Auxiliary targets need not end at the action-chunk boundary. This
+        # changes training targets only, never deployed observations/tokens.
+        self.role_future_target_mode = config.get("role_future_target_mode", "chunk")
+        if self.role_future_target_mode not in {"chunk", "all_reviewed"}:
+            raise ValueError("role_future_target_mode must be chunk or all_reviewed")
 
     def _zero(self):
         # Every rank must retain all parameters even when its labels are absent.
@@ -133,8 +141,9 @@ completeness and donor semantic eligibility are validated by the dataset.
         effect = self.effect_norm(queries + effect).reshape(b, s, 2, self.hidden_dim)
         return binding, effect, logits
 
-    def _memory(self, human_features, *, compute_base_aux=False, robot_features=None):
-        base, losses = super().forward(human_features, robot_features, compute_aux=compute_base_aux)
+    def _memory(self, human_features, *, compute_base_aux=False, robot_features=None, transfer_valid=None):
+        base, losses = super().forward(human_features, robot_features, compute_aux=compute_base_aux,
+                                      transfer_valid=transfer_valid)
         human = self._prepare_features(human_features)
         b, s = human.shape[:2]
         binding, effect, logits = self._human_role_memory(human)
@@ -174,6 +183,22 @@ completeness and donor semantic eligibility are validated by the dataset.
                 raise ValueError(f"Valid {prefix} roles must have nonempty masks")
             result[prefix + "_masks"], result[prefix + "_valid"] = mask, valid
             if prefix == "robot":
+                effect_valid = targets.get("robot_effect_valid", valid)
+                if (not torch.is_tensor(effect_valid) or effect_valid.dtype != torch.bool
+                        or tuple(effect_valid.shape) != shape[:-1]):
+                    raise ValueError("robot_effect_valid must be matching boolean [B,Tr,2]")
+                effect_valid = effect_valid.detach().to(mask.device)
+                if bool((effect_valid & ~valid).any()):
+                    raise ValueError("Effect supervision requires a valid visible-region mask")
+                result["robot_effect_valid"] = effect_valid
+                relation_valid = targets.get("robot_relation_valid", effect_valid)
+                if (not torch.is_tensor(relation_valid) or relation_valid.dtype != torch.bool
+                        or tuple(relation_valid.shape) != shape[:-1]):
+                    raise ValueError("robot_relation_valid must be matching boolean [B,Tr,2]")
+                relation_valid = relation_valid.detach().to(mask.device)
+                if bool((relation_valid & ~valid).any()):
+                    raise ValueError("Relation supervision requires a valid visible-region mask")
+                result["robot_relation_valid"] = relation_valid
                 identities = targets.get("robot_entity_ids")
                 if identities is None:
                     # Compatibility for explicitly stable-role module callers.
@@ -185,6 +210,12 @@ completeness and donor semantic eligibility are validated by the dataset.
                 if bool((identities < -1).any()):
                     raise ValueError("robot_entity_ids must be nonnegative or -1 for unknown")
                 result["robot_entity_ids"] = identities
+        cross_valid = targets.get("cross_effect_valid")
+        if cross_valid is not None:
+            if (not torch.is_tensor(cross_valid) or cross_valid.dtype != torch.bool
+                    or tuple(cross_valid.shape) != (human_features.shape[0],)):
+                raise ValueError("cross_effect_valid must be boolean [B]")
+            result["cross_effect_valid"] = cross_valid.detach().to(human_features.device)
         return result
 
     @staticmethod
@@ -201,14 +232,15 @@ completeness and donor semantic eligibility are validated by the dataset.
     def forward(self, human_features, robot_features=None, compute_aux=False, *,
                 role_targets=None, donor_human_features=None, donor_valid=None,
                 return_aux_context=False):
+        targets = self._targets(role_targets, human_features, robot_features) if compute_aux else {}
         memory, losses, logits = self._memory(human_features, compute_base_aux=compute_aux,
-                                             robot_features=robot_features)
+                                             robot_features=robot_features,
+                                             transfer_valid=targets.get("cross_effect_valid"))
         context = None
         if compute_aux:
             zero = self._zero()
             losses = dict(losses)
             losses.update({key: zero for key in ROLE_LOSS_KEYS})
-            targets = self._targets(role_targets, human_features, robot_features)
             if "human_masks" in targets:
                 losses["role_human"] = self._mask_loss(logits, targets["human_masks"], targets["human_valid"]) + zero
             losses["total"] = losses["total"] + self.role_loss_weights["role_human"] * losses["role_human"] + zero
@@ -312,6 +344,9 @@ completeness and donor semantic eligibility are validated by the dataset.
         teacher = F.interpolate(masks[:, observed_index].reshape(-1, 1, side, side),
                                 size=shape, mode="area").reshape(masks.shape[0], 2, -1)
         losses["role_robot"] = self._mask_loss(logits, teacher, valid[:, observed_index])
+        if self.role_future_target_mode == "all_reviewed":
+            future_indices = list(range(observed_index + 1,
+                                        min(robot.shape[1], observed_index + self.max_future_steps + 1)))
         future = torch.as_tensor(future_indices, device=robot.device, dtype=torch.long)
         if future.numel() == 0:
             return tokens, {key: value + zero for key, value in losses.items()}
@@ -323,13 +358,21 @@ completeness and donor semantic eligibility are validated by the dataset.
         xy = self._square_grid(robot.shape[-2], robot.device, robot.dtype)
         object_features, geometry = self._pool(robot, masks, xy)
         target_delta = (object_features[:, future] - object_features[:, observed_index:observed_index + 1]).detach().float()
-        object_valid = valid[:, future] & valid[:, observed_index:observed_index + 1]
+        effect_valid = targets.get("robot_effect_valid", valid)
+        object_valid = effect_valid[:, future] & effect_valid[:, observed_index:observed_index + 1]
+        if "cross_effect_valid" in targets:
+            object_valid = object_valid & targets["cross_effect_valid"][:, None, None]
         identities = targets["robot_entity_ids"]
         current_identities = identities[:, observed_index:observed_index + 1]
         object_valid = object_valid & (identities[:, future] == current_identities) & (current_identities >= 0)
         relation = geometry[..., 0, :2] - geometry[..., 1, :2]
         target_relation = (relation[:, future] - relation[:, observed_index:observed_index + 1]).detach().float()
-        relation_valid = object_valid.all(-1)
+        geometry_valid = targets.get("robot_relation_valid", effect_valid)
+        geometry_pair_valid = (geometry_valid[:, future] & geometry_valid[:, observed_index:observed_index + 1]
+                               & (identities[:, future] == current_identities) & (current_identities >= 0))
+        relation_valid = geometry_pair_valid.all(-1)
+        if "cross_effect_valid" in targets:
+            relation_valid = relation_valid & targets["cross_effect_valid"][:, None]
 
         def effect_losses(effect_memory):
             pred, rel = self._decode_effect(grounded, effect_memory, offsets)

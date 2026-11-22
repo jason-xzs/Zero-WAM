@@ -22,8 +22,8 @@ va_robotwin_train_cfg.action_stats_path = str(
     Path(va_robotwin_train_cfg.dataset_path) / 'meta' / 'action_stats.json'
 )
 va_robotwin_train_cfg.load_robotwin_stats_from_dataset = True
-va_robotwin_train_cfg.icl_manifest_path = str(
-    _human_gen_root / 'icl_configs' / 'ICL_config_robotwin.json'
+va_robotwin_train_cfg.icl_manifest_path = os.environ.get(
+    'ZERO_WAM_ICL_MANIFEST', str(_human_gen_root / 'icl_configs' / 'ICL_config_robotwin.json')
 )
 va_robotwin_train_cfg.human_latent_path = str(
     _human_gen_root / 'human_latents' / 'robotwin'

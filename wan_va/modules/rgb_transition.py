@@ -179,19 +179,32 @@ class RGBTransitionConditioner(nn.Module):
             )
         return features.to(dtype=self.tokenizer.current_input_proj.weight.dtype)
 
-    def _rgb_loss(self, current, future, tokens):
+    def _rgb_loss(self, current, future, tokens, valid=None):
         prediction = self.tokenizer.decode_delta(
             current, tokens, num_future_steps=future.shape[1]
         )
         target = (future - current[:, None]).detach()
-        l1 = F.l1_loss(prediction.float(), target.float())
-        cosine = self.tokenizer._token_cosine_loss(prediction, target)
+        if valid is None:
+            l1 = F.l1_loss(prediction.float(), target.float())
+            cosine = self.tokenizer._token_cosine_loss(prediction, target)
+        else:
+            # A semantically mismatched human/robot pair is not a positive
+            # cross-embodiment target. Self-reconstruction remains available.
+            weights = valid.detach().to(prediction.device, dtype=torch.float32)
+            l1_per_example = (prediction.float() - target.float()).abs().flatten(1).mean(1)
+            cosine_per_example = 1 - (F.normalize(prediction.float(), dim=-1) *
+                                      F.normalize(target.float(), dim=-1)).sum(-1).flatten(1).mean(1)
+            l1 = (l1_per_example * weights).sum() / weights.sum().clamp_min(1)
+            cosine = (cosine_per_example * weights).sum() / weights.sum().clamp_min(1)
         return self.l1_weight * l1 + self.cosine_weight * cosine, l1, cosine
 
-    def forward(self, human_features, robot_features=None, compute_aux=False):
+    def forward(self, human_features, robot_features=None, compute_aux=False, *, transfer_valid=None):
         """Return human-only tokens and auxiliary losses (empty when disabled)."""
         self._validate_features(human_features, "human_features", 5, min_frames=2)
         batch, clips, frames, patches, dim = human_features.shape
+        if transfer_valid is not None and (not torch.is_tensor(transfer_valid)
+                or transfer_valid.dtype != torch.bool or tuple(transfer_valid.shape) != (batch,)):
+            raise ValueError("transfer_valid must be boolean [B]")
         if clips > self.max_clips:
             raise ValueError("human_features clip count exceeds max_clips")
         if robot_features is not None:
@@ -230,7 +243,7 @@ class RGBTransitionConditioner(nn.Module):
             # No robot-future token enters this path: the future is only its
             # detached prediction target, and human tokens preserve clip order.
             objectives["transfer"] = self._rgb_loss(
-                robot[:, 0], robot[:, 1:], tokens
+                robot[:, 0], robot[:, 1:], tokens, valid=transfer_valid
             )
 
         losses = {}

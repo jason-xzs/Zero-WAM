@@ -179,3 +179,60 @@ def test_unknown_entities_are_not_counted_as_usable_future_targets():
     valid = torch.ones(4, 2, dtype=torch.bool)
     ids = torch.full((4, 2), -1, dtype=torch.int64)
     assert usable_future_pairs(valid, ids, 2) == (0, 0)
+
+
+def test_sparse_far_targets_respect_per_loss_validity_and_identity():
+    visible = torch.zeros(12, 2, dtype=torch.bool)
+    visible[[0, 10]] = True
+    ids = torch.arange(2).expand(12, 2).clone()
+    relation = visible.clone()
+    relation[10, 1] = False
+    assert usable_future_pairs(visible, ids, 2) == (0, 0)
+    assert usable_future_pairs(visible, ids, 2, mode='all_reviewed', relation_valid=relation) == (2, 0)
+    assert usable_future_pairs(visible, ids, 2, mode='all_reviewed', max_future_steps=5) == (0, 0)
+    ids[10, 0] = 2
+    assert usable_future_pairs(visible, ids, 2, mode='all_reviewed') == (1, 0)
+
+
+def _sparse_fixture(tmp_path):
+    path, records, payloads = _fixture(tmp_path)
+    records[0].pop('donor_pair_key')
+    for record in records:
+        record.update(cross_effect_approved=True, supervision_status='usable',
+                      supervision_review='Synthetic explicit sparse review for unit testing')
+        ap = Path(record['annotation_file'])
+        a = torch.load(ap, weights_only=True)
+        a['metadata']['schema_version'] = 2
+        a['robot_effect_valid'] = a['robot_valid'].clone()
+        a['robot_relation_valid'] = torch.zeros_like(a['robot_valid'])
+        a['cross_effect_valid'] = torch.tensor(True)
+        torch.save(a, ap)
+        record['annotation_sha256'] = file_sha256(ap)
+    path.write_text(json.dumps(dict(schema_version=2, split='train', records=records)))
+    return path, records, payloads
+
+
+def test_sparse_manifest_requires_every_record_and_explicit_scope(tmp_path):
+    path, records, payloads = _sparse_fixture(tmp_path)
+    m = RoleManifest(path, ['place_mouse_pad'])
+    labels, _, _ = m.load('0:pair', *payloads[0], require_complete=False, require_record=True)
+    assert labels['robot_effect_valid'].all() and not labels['robot_relation_valid'].any()
+    with pytest.raises(ValueError, match='Missing reviewed'):
+        m.load('absent', *payloads[0], require_complete=False, require_record=True)
+    records[0]['supervision_status'] = 'excluded'
+    path.write_text(json.dumps(dict(schema_version=2, split='train', records=records)))
+    with pytest.raises(ValueError, match='contradicts'):
+        RoleManifest(path, ['place_mouse_pad']).load('0:pair', *payloads[0], require_complete=False)
+
+
+@pytest.mark.parametrize('field', ['robot_effect_valid', 'robot_relation_valid', 'cross_effect_valid'])
+def test_sparse_missing_loss_scope_is_not_implicitly_approved(tmp_path, field):
+    path, records, payloads = _sparse_fixture(tmp_path)
+    ap = Path(records[0]['annotation_file'])
+    a = torch.load(ap, weights_only=True)
+    a.pop(field)
+    torch.save(a, ap)
+    records[0]['annotation_sha256'] = file_sha256(ap)
+    path.write_text(json.dumps(dict(schema_version=2, split='train', records=records)))
+    with pytest.raises(ValueError, match='valid|boolean'):
+        RoleManifest(path, ['place_mouse_pad']).load('0:pair', *payloads[0], require_complete=False)

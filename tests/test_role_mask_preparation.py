@@ -37,18 +37,34 @@ def _seeds():
     }
 
 
+def test_reviewed_correction_points_are_explicit_and_original_pixel_bounded():
+    seeds = _seeds()
+    seeds['objects']['0']['corrections'] = [dict(frame=3, points_xy=[[2, 2], [8, 8]],
+                                               point_labels=[1, 0], review='Synthetic visual decision')]
+    plan = preparation.normalize_role_seeds(seeds, 6, 16, 16)
+    assert plan['objects'][0]['corrections'][0]['point_labels'] == [1, 0]
+    for change in ({'frame': 0}, {'frame': 6}, {'review': ''}, {'points_xy': [[18, 2], [8, 8]]}):
+        bad = deepcopy(seeds)
+        bad['objects']['0']['corrections'][0].update(change)
+        with pytest.raises(ValueError, match='Correction'):
+            preparation.normalize_role_seeds(bad, 6, 16, 16)
+
+
 class FakePredictor:
     """Expose the official predictor interface with deterministic visible masks."""
 
     def __init__(self):
         self.masks = {}
         self.reset = False
+        self.point_prompts = {}
 
     def init_state(self, path, **kwargs):
         return {"obj_id_to_idx": {}, "output_dict_per_obj": {}}
 
-    def add_new_points_or_box(self, state, frame_idx, obj_id, box):
-        assert frame_idx == 0
+    def add_new_points_or_box(self, state, frame_idx, obj_id, box, points=None, labels=None):
+        self.seed_frame = frame_idx
+        if points is not None:
+            self.point_prompts[obj_id] = (points.tolist(), labels.tolist())
         x1, y1, x2, y2 = map(int, box)
         mask = torch.zeros(16, 16, dtype=torch.bool)
         mask[y1:y2, x1:x2] = True
@@ -59,8 +75,9 @@ class FakePredictor:
             "cond_frame_outputs": {}, "non_cond_frame_outputs": {},
         }
 
-    def propagate_in_video(self, state):
-        for frame in range(6):
+    def propagate_in_video(self, state, start_frame_idx=0):
+        assert start_frame_idx == self.seed_frame
+        for frame in range(start_frame_idx, 6):
             for obj_id, index in state["obj_id_to_idx"].items():
                 # The second moving object becomes unobservable at frame 4.
                 score = -5.0 if frame == 4 and obj_id == 3 else 5.0
@@ -89,7 +106,8 @@ def _no_cuda(monkeypatch):
 
 
 @pytest.mark.parametrize("kind", ["human", "robot"])
-def test_multistage_preparation_preserves_cache_timeline_and_visibility(tmp_path, monkeypatch, kind):
+@pytest.mark.parametrize("with_points", [False, True])
+def test_multistage_preparation_preserves_cache_timeline_and_visibility(tmp_path, monkeypatch, kind, with_points):
     # Human segments can repeat frames; robot samples have a single time axis.
     indices = (torch.tensor([[0, 1, 2, 3], [2, 3, 4, 5]]) if kind == "human"
                else torch.arange(6))
@@ -112,11 +130,14 @@ def test_multistage_preparation_preserves_cache_timeline_and_visibility(tmp_path
 
     monkeypatch.setattr(preparation, "extract_video", fake_extract)
     predictor = FakePredictor()
+    seeds = _seeds()
+    if with_points:
+        seeds["objects"]["1"].update(points_xy=[[7, 2], [2, 2]], point_labels=[1, 0])
     coverage, valid, returned_indices, identities, report = preparation.process_video(
         predictor,
         {"label": "synthetic", f"{kind}_cache_path": str(cache),
          f"{kind}_video_path": relocated},
-        kind, _seeds(), tmp_path / "output",
+        kind, seeds, tmp_path / "output",
         SimpleNamespace(min_object_probability=.8, min_mask_pixels=1,
                         min_area_ratio=.25, max_area_ratio=2., max_overlap_fraction=.2),
     )
@@ -132,6 +153,7 @@ def test_multistage_preparation_preserves_cache_timeline_and_visibility(tmp_path
     assert coverage.shape == (*indices.shape, 2, 256)
     assert not coverage[~valid].any()
     assert set(predictor.masks) == {1, 2, 3} and predictor.reset
+    assert predictor.point_prompts == ({2: ([[7., 2.], [2., 2.]], [1, 0])} if with_points else {})
 
     # A 16x16 input pixel maps exactly to a single DINO patch after resizing.
     expected_coverage = torch.zeros(6, 2, 16, 16)
@@ -163,6 +185,62 @@ def test_legacy_two_role_seeds_keep_persistent_ids_at_both_video_ends():
             frame, masks, [True, True], plan)
         assert torch.equal(selected, masks) and valid.all()
         assert identities.tolist() == [0, 1]
+
+
+@pytest.mark.parametrize("points,labels", [
+    (None, [1]), ([[2, 2]], None), ([], []), ([[2, 2]], [1, 0]),
+    ([[2, 2]], [2]), ([[2, 2]], [True]), ([[2, 2]], [1.0]),
+    ([[16, 2]], [1]), ([[-1, 2]], [1]), ([[2, 16]], [1]),
+    ([[float("nan"), 2]], [1]), ([[True, 2]], [1]), ([[2]], [1]),
+])
+def test_malformed_point_prompts_rejected(points, labels):
+    seeds = _seeds()
+    seeds["objects"]["0"].update(points_xy=points, point_labels=labels)
+    with pytest.raises(ValueError, match="point"):
+        preparation.normalize_role_seeds(seeds, 6, 16, 16)
+
+
+def test_later_visible_seed_never_supervises_or_extrapolates_earlier_frames(tmp_path, monkeypatch):
+    indices = torch.arange(6)
+    cache = tmp_path / "rgb.pth"
+    torch.save({"features": torch.zeros(6, 256, 768, dtype=torch.float16),
+                "frame_indices": indices,
+                "metadata": {"source_video_path": "/data/" + ROBOT_SUFFIX,
+                             "preprocessing": {"config": {"size": {"height": 224, "width": 224},
+                                                            "do_center_crop": False}}}}, cache)
+    monkeypatch.setattr(preparation, "extract_video", lambda *args: (
+        {i: Image.new("RGB", (16, 16), "white") for i in range(6)},
+        {"frames": 6, "width": 16, "height": 16, "fps": 24}))
+    predictor = FakePredictor()
+    coverage, valid, returned, identities, report = preparation.process_video(
+        predictor, {"label": "late", "robot_cache_path": str(cache)}, "robot",
+        {"seed_frame": 3, "boxes_xyxy": {"source": [1, 1, 5, 5], "reference": [6, 1, 10, 5]}},
+        tmp_path / "output", SimpleNamespace(min_object_probability=.8, min_mask_pixels=1,
+                                             min_area_ratio=.25, max_area_ratio=2., max_overlap_fraction=.2))
+    assert torch.equal(returned, indices)
+    assert not coverage[:3].any() and not valid[:3].any()
+    assert (identities[:3] == -1).all()
+    assert valid[3:].all() and (coverage[3:].sum(-1) > 0).all()
+    assert (identities[3:] == torch.tensor([0, 1])).all()
+    assert set(report["all_frame_stats"]) == {str(i) for i in range(6)}
+    assert report["all_frame_stats"]["2"][0]["invalid_reasons"] == ["before_first_visible_seed"]
+    assert len(list((tmp_path / "output" / "late_robot").glob("overlay_*.png"))) == 6
+    assert predictor.reset
+
+
+@pytest.mark.parametrize("seed_frame", [-1, 6, True, 1.5, "3"])
+def test_invalid_seed_frame_is_rejected(seed_frame):
+    with pytest.raises(ValueError, match="seed_frame"):
+        preparation.normalize_role_seeds(
+            {"seed_frame": seed_frame, "boxes_xyxy": {"source": [1, 1, 5, 5],
+                                                       "reference": [6, 1, 10, 5]}}, 6, 16, 16)
+
+
+def test_explicit_events_cannot_claim_identity_before_later_seed():
+    seeds = _seeds()
+    seeds["seed_frame"] = 3
+    with pytest.raises(ValueError, match="bounds"):
+        preparation.normalize_role_seeds(seeds, 6, 16, 16)
 
 
 def test_uncovered_video_does_not_infer_roles_from_object_order():

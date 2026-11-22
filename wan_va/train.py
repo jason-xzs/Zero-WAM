@@ -194,7 +194,7 @@ def _build_dataset_sources(config, args, rank, local_rank, world_size):
         for key in ('enable_rgb_transition', 'rgb_feature_root',
                     'rgb_transition_config', 'rgb_smoke_sample_ids',
                     'rgb_encoder_id', 'rgb_encoder_revision', 'rgb_preprocessing',
-                    'role_manifest_path', 'role_require_complete',
+                    'role_manifest_path', 'role_require_complete', 'role_require_all_records',
                     'frame_chunk_size', 'max_frame_chunk_size'):
             if hasattr(config, key):
                 dataset_config[key] = deepcopy(config[key])

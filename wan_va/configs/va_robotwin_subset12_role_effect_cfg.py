@@ -5,12 +5,13 @@ The smoke recipe explicitly permits partial annotation and reports coverage.
 """
 from copy import deepcopy
 import os
+from pathlib import Path
 
 from .va_robotwin_subset12_rgb_readout_cfg import make_rgb_readout_config
 
 
-def make_role_effect_config():
-    cfg = deepcopy(make_rgb_readout_config("state", "train"))
+def make_role_effect_config(platform="train"):
+    cfg = deepcopy(make_rgb_readout_config("state", platform))
     cfg.__name__ = "Config: role/effect subset12 train"
     cfg.role_manifest_path = os.environ.get(
         "ZERO_WAM_ROLE_MANIFEST", "/workspace/zero-wam/datasets/role_effect/manifest.json"
@@ -33,3 +34,23 @@ def make_role_effect_config():
 
 
 va_robotwin_subset12_role_effect_cfg = make_role_effect_config()
+
+
+def make_sparse_role_effect_config(platform):
+    """Reviewed policy pairs; visible-region and effect labels may be sparse.
+
+    This is a new experimental protocol, not a bypass of the legacy complete
+    annotation preflight. Missing review records still fail before training.
+    """
+    cfg = make_role_effect_config(platform)
+    cfg.__name__ = f'Config: role/effect reviewed sparse subset12 {platform}'
+    cfg.role_require_complete = False
+    cfg.role_require_all_records = True
+    cfg.icl_manifest_path = os.environ.get(
+        'ZERO_WAM_ICL_MANIFEST', str(Path(cfg.role_manifest_path).parent / 'icl_manifest.train.json'))
+    cfg.rgb_transition_config['role_future_target_mode'] = 'all_reviewed'
+    return cfg
+
+
+va_robotwin_subset12_role_effect_sparse_cfg = make_sparse_role_effect_config('train')
+va_robotwin_subset12_role_effect_sparse_b300_cfg = make_sparse_role_effect_config('b300')

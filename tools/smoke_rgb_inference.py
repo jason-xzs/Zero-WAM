@@ -266,6 +266,9 @@ def run_gpu(args, first, second, prompt, observations, report):
         def rgb_call(_module, inputs, kwargs):
             if kwargs.get("compute_aux", False) or kwargs.get("robot_features") is not None:
                 raise AssertionError("Inference must not use robot future features or auxiliary targets")
+            if any(kwargs.get(key) is not None for key in (
+                    "role_targets", "donor_human_features", "donor_valid")):
+                raise AssertionError("Inference must not consume role labels or donor supervision")
             calls.append({"human_feature_shape": list(inputs[0].shape)})
 
         hooks.append(server.transformer.rgb_transition.register_forward_pre_hook(rgb_call, with_kwargs=True))

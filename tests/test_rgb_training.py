@@ -141,8 +141,12 @@ def test_wandb_reports_optimizer_window_and_all_rgb_loss_components(monkeypatch)
     trainer._get_next_batch = lambda: next(batches)
     events = []
     trainer.wandb = SimpleNamespace(
-        log=lambda values, step: events.append((dict(values), step))
+        log=lambda values, step: events.append((dict(values), step)),
+        finish=lambda: None,
     )
+    # This test checks optimizer-window logging, not checkpoint I/O. Some
+    # deployment recipes also save the last step outside save_interval.
+    trainer.save_checkpoint = lambda: None
     monkeypatch.delenv("ZERO_WAM_METRICS_PATH", raising=False)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
